@@ -6,10 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		963E525E2ED2DECA00BCA06F /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 963E525D2ED2DECA00BCA06F /* GRDB */; };
-/* End PBXBuildFile section */
-
 /* Begin PBXContainerItemProxy section */
 		963E52002ED2C2AA00BCA06F /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -56,7 +52,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				963E525E2ED2DECA00BCA06F /* GRDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -117,7 +112,6 @@
 			);
 			name = prism;
 			packageProductDependencies = (
-				963E525D2ED2DECA00BCA06F /* GRDB */,
 			);
 			productName = prism;
 			productReference = 963E51F02ED2C2A800BCA06F /* prism.app */;
@@ -201,9 +195,6 @@
 			);
 			mainGroup = 963E51E72ED2C2A800BCA06F;
 			minimizedProjectReferenceProxies = 1;
-			packageReferences = (
-				963E525C2ED2DEB300BCA06F /* XCRemoteSwiftPackageReference "GRDB" */,
-			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 963E51F12ED2C2A800BCA06F /* Products */;
 			projectDirPath = "";
@@ -407,7 +398,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = C469MNKW5R;
-				ENABLE_APP_SANDBOX = NO;
+				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -439,7 +430,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = C469MNKW5R;
-				ENABLE_APP_SANDBOX = NO;
+				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -582,25 +573,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		963E525C2ED2DEB300BCA06F /* XCRemoteSwiftPackageReference "GRDB" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/groue/GRDB.swift";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 6.29.3;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		963E525D2ED2DECA00BCA06F /* GRDB */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 963E525C2ED2DEB300BCA06F /* XCRemoteSwiftPackageReference "GRDB" */;
-			productName = GRDB;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 963E51E82ED2C2A800BCA06F /* Project object */;
 }

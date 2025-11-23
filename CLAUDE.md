@@ -42,6 +42,14 @@ This is a greenfield project with no existing source code yet. Once the Xcode pr
    - **Results Table**: `NSTableView` with virtualization for 5M rows
    - **Interactions**: Drag-and-drop to Finder/DAWs, QuickLook (Spacebar), context menus
 
+### Audio File Filtering
+
+The scanner only indexes audio files with the following extensions:
+- Common: mp3, wav, flac, aac, m4a, ogg, wma, aiff/aif
+- Advanced: ape, opus, alac, dsd, dsf, mp2, mpc, wv, tta, ac3, dts
+
+Non-audio files are skipped during scanning.
+
 ### Two-Phase Indexing
 
 - **Phase 1 (Scan)**: Index name, path, size, date immediately

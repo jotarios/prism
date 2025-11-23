@@ -6,27 +6,23 @@
 //
 
 import SwiftUI
-import SwiftData
 
 @main
 struct prismApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
-
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            MainWindow()
+                .preferredColorScheme(.dark)
+                .frame(minWidth: 900, minHeight: 600)
         }
-        .modelContainer(sharedModelContainer)
+        .commands {
+            CommandGroup(replacing: .newItem) { }
+        }
+
+        // Settings window
+        Settings {
+            SettingsView(viewModel: SearchViewModel.shared)
+                .frame(minWidth: 600, minHeight: 500)
+        }
     }
 }
