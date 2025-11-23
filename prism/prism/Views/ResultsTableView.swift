@@ -11,6 +11,7 @@ struct ResultsTableView: View {
     @ObservedObject var viewModel: SearchViewModel
     @State private var selection = Set<SearchResult.ID>()
     @State private var quickLookURL: URL?
+    @State private var sortOrder = [KeyPathComparator(\SearchResult.filename)]
 
     var body: some View {
         VStack {
@@ -20,6 +21,12 @@ struct ResultsTableView: View {
                 resultsTable
             }
         }
+    }
+
+    // MARK: - Computed Properties
+
+    private var sortedResults: [SearchResult] {
+        viewModel.results.sorted(using: sortOrder)
     }
 
     // MARK: - Subviews
@@ -32,7 +39,7 @@ struct ResultsTableView: View {
             } primaryAction: { items in
                 // Double-click action
                 if let id = items.first,
-                   let result = viewModel.results.first(where: { $0.id == id }) {
+                   let result = sortedResults.first(where: { $0.id == id }) {
                     quickLookURL = URL(fileURLWithPath: result.path)
                 }
             }
@@ -56,8 +63,8 @@ struct ResultsTableView: View {
     }
 
     private func createTable() -> some View {
-        Table(viewModel.results, selection: $selection) {
-            TableColumn("Name") { result in
+        Table(sortedResults, selection: $selection, sortOrder: $sortOrder) {
+            TableColumn("Name", value: \.filename) { result in
                 HStack(spacing: 8) {
                     Image(systemName: "music.note")
                         .foregroundStyle(.blue)
@@ -66,13 +73,13 @@ struct ResultsTableView: View {
             }
             .width(min: 200, ideal: 300)
 
-            TableColumn("Date Modified") { result in
+            TableColumn("Date Modified", value: \.dateModified) { result in
                 Text(result.dateModified.formatted(date: .abbreviated, time: .shortened))
                     .monospacedDigit()
             }
             .width(min: 140, ideal: 160)
 
-            TableColumn("Size") { result in
+            TableColumn("Size", value: \.sizeBytes) { result in
                 Text(result.formattedSize)
                     .monospacedDigit()
             }
@@ -84,7 +91,7 @@ struct ResultsTableView: View {
             }
             .width(min: 80, ideal: 100)
 
-            TableColumn("Path") { result in
+            TableColumn("Path", value: \.path) { result in
                 Text(result.path)
                     .foregroundStyle(.secondary)
                     .font(.caption)
@@ -105,7 +112,7 @@ struct ResultsTableView: View {
         if items.isEmpty {
             EmptyView()
         } else if items.count == 1 {
-            if let result = viewModel.results.first(where: { $0.id == items.first }) {
+            if let result = sortedResults.first(where: { $0.id == items.first }) {
                 Button("Show in Finder") {
                     showInFinder(result)
                 }
@@ -120,7 +127,7 @@ struct ResultsTableView: View {
         } else {
             Button("Show in Finder") {
                 for id in items {
-                    if let result = viewModel.results.first(where: { $0.id == id }) {
+                    if let result = sortedResults.first(where: { $0.id == id }) {
                         showInFinder(result)
                     }
                 }
@@ -130,7 +137,7 @@ struct ResultsTableView: View {
 
     private func handleSpaceKey() {
         if let selectedID = selection.first,
-           let result = viewModel.results.first(where: { $0.id == selectedID }) {
+           let result = sortedResults.first(where: { $0.id == selectedID }) {
             quickLookURL = URL(fileURLWithPath: result.path)
         }
     }

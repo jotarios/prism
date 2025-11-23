@@ -19,7 +19,8 @@ final class FileScanner {
     private let dbManager = DatabaseManager.shared
 
     private var isCancelled = false
-    private let progressInterval = 1000 // Report every N files
+    private let progressInterval = 50 // Report every N files for better feedback
+    private let batchSize = 2000 // Larger batches for better performance
 
     // Audio file extensions to index
     private let audioExtensions: Set<String> = [
@@ -44,14 +45,18 @@ final class FileScanner {
 
         isCancelled = false
         var scannedCount = 0
+        var totalFilesChecked = 0
         var batch: [FileRecordInsert] = []
-        batch.reserveCapacity(10000)
+        batch.reserveCapacity(batchSize)
 
         // Use breadth-first traversal
         var queue: [URL] = [URL(fileURLWithPath: path)]
 
         while !queue.isEmpty && !isCancelled {
             let currentURL = queue.removeFirst()
+
+            // Report directory being scanned
+            progressCallback?(scannedCount, currentURL.lastPathComponent)
 
             // Scan current directory
             do {
@@ -119,16 +124,17 @@ final class FileScanner {
                             scannedCount += 1
 
                             // Insert batch when it reaches size
-                            // Use smaller batches (100-500) to minimize write lock duration
-                            // This allows UI queries to slip in between commits
-                            if batch.count >= 250 {
+                            if batch.count >= batchSize {
                                 try dbManager.insertFiles(batch)
                                 batch.removeAll(keepingCapacity: true)
+
+                                // Report progress after each batch insert
+                                progressCallback?(scannedCount, currentURL.path)
                             }
 
-                            // Report progress
+                            // Report progress more frequently
                             if scannedCount % progressInterval == 0 {
-                                progressCallback?(scannedCount, path)
+                                progressCallback?(scannedCount, currentURL.path)
                             }
                         }
                     } catch {

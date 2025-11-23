@@ -101,19 +101,21 @@ class SearchViewModel: ObservableObject {
 
     func scanVolume(_ volume: VolumeInfo) {
         isScanning = true
-        scanProgress = "Scanning \(volume.name)..."
+        scanProgress = "Starting scan of \(volume.name)..."
 
         // Run scan on background thread (fire and forget)
         Task.detached {
             do {
-                try await self.scanner.scanVolume(path: volume.path) { count, path in
+                try await self.scanner.scanVolume(path: volume.path) { count, currentPath in
                     Task { @MainActor in
-                        self.scanProgress = "Scanned \(count) files..."
+                        // Extract just the last path component for cleaner display
+                        let lastComponent = URL(fileURLWithPath: currentPath).lastPathComponent
+                        self.scanProgress = "Found \(count) files... (\(lastComponent))"
                     }
                 }
 
                 await MainActor.run {
-                    self.scanProgress = "Scan complete!"
+                    self.scanProgress = "Scan complete! Indexing..."
                     // Reload files to show new results
                     self.loadAllFiles()
                 }
