@@ -4,6 +4,8 @@
 
 Prism is a high-performance desktop search utility for macOS that maintains a lightweight SQLite database to enable instant filename search across massive audio libraries (5M+ files) on external drives.
 
+![Prism Preview](docs/img/prism_preview.png)
+
 ## Features
 
 - **Instant Search**: Sub-100ms search latency for millions of files using SQLite FTS5
@@ -16,6 +18,7 @@ Prism is a high-performance desktop search utility for macOS that maintains a li
 ## Supported Audio Formats
 
 **Common**: mp3, wav, flac, aac, m4a, ogg, wma, aiff, aif
+
 **Advanced**: ape, opus, alac, dsd, dsf, mp2, mpc, wv, tta, ac3, dts
 
 ## Requirements
