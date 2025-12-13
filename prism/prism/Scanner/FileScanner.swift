@@ -12,7 +12,7 @@ enum ScannerError: Error {
 }
 
 /// Progress callback for scanning
-typealias ScanProgressCallback = (Int, String) -> Void
+typealias ScanProgressCallback = (Int, String) async -> Void
 
 final class FileScanner {
     private let volumeManager = VolumeManager.shared
@@ -59,7 +59,7 @@ final class FileScanner {
             await Task.yield()
 
             // Report directory being scanned
-            progressCallback?(scannedCount, currentURL.lastPathComponent)
+            await progressCallback?(scannedCount, currentURL.lastPathComponent)
 
             // Scan current directory
             do {
@@ -137,14 +137,14 @@ final class FileScanner {
                                 await Task.yield()
 
                                 // Report progress after each batch insert
-                                progressCallback?(scannedCount, currentURL.path)
+                                await progressCallback?(scannedCount, currentURL.path)
                             }
 
                             // Report progress more frequently
                             if scannedCount % progressInterval == 0 {
                                 // Yield periodically even between batches
                                 await Task.yield()
-                                progressCallback?(scannedCount, currentURL.path)
+                                await progressCallback?(scannedCount, currentURL.path)
                             }
                         }
                     } catch {
@@ -164,7 +164,7 @@ final class FileScanner {
         }
 
         // Final progress report
-        progressCallback?(scannedCount, "Completed")
+        await progressCallback?(scannedCount, "Completed")
     }
 
     /// Cancel ongoing scan
