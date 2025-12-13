@@ -107,10 +107,9 @@ class SearchViewModel: ObservableObject {
         Task.detached {
             do {
                 try await self.scanner.scanVolume(path: volume.path) { count, currentPath in
-                    Task { @MainActor in
-                        // Extract just the last path component for cleaner display
-                        let lastComponent = URL(fileURLWithPath: currentPath).lastPathComponent
-                        self.scanProgress = "Found \(count) files... (\(lastComponent))"
+                    // Use await MainActor.run for immediate UI updates
+                    await MainActor.run {
+                        self.scanProgress = "Found \(count) files..."
                     }
                 }
 

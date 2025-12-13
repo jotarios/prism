@@ -88,12 +88,13 @@ final class ScannerTests: XCTestCase {
     }
 
     func testScanLargeDirectory() async throws {
-        // Create more files to test batching
+        // Create more audio files to test batching
         let largeDir = testDirectory.appendingPathComponent("Large")
         try FileManager.default.createDirectory(at: largeDir, withIntermediateDirectories: true)
 
+        // Create 100 audio files (mp3) for testing
         for i in 1...100 {
-            let file = largeDir.appendingPathComponent("file_\(i).txt")
+            let file = largeDir.appendingPathComponent("file_\(i).mp3")
             try "Test content".write(to: file, atomically: true, encoding: .utf8)
         }
 
@@ -102,11 +103,12 @@ final class ScannerTests: XCTestCase {
         let elapsed = Date().timeIntervalSince(startTime)
 
         let fileCount = try await dbManager.getFileCount()
-        XCTAssertEqual(fileCount, 125, "Should have indexed 125 files")
+        // 10 (Music) + 5 (Music/Album1) + 100 (Large) = 115 audio files
+        XCTAssertEqual(fileCount, 115, "Should have indexed 115 audio files")
 
-        print("Scanned and indexed 125 files in \(elapsed) seconds")
+        print("Scanned and indexed 115 audio files in \(elapsed) seconds")
 
         // Should be fast
-        XCTAssertLessThan(elapsed, 2.0, "Should scan 125 files in under 2 seconds")
+        XCTAssertLessThan(elapsed, 2.0, "Should scan 115 files in under 2 seconds")
     }
 }
