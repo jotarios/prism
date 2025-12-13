@@ -10,24 +10,46 @@ final class DatabaseTests: XCTestCase {
 
     var dbManager: DatabaseManager!
 
-    override func setUp() async throws {
-        // Use a temporary database for testing
+    override func setUp() {
+        super.setUp()
+        // Use the shared database manager
         dbManager = DatabaseManager.shared
-        try dbManager.open()
-        try dbManager.rebuildDatabase()
+
+        print("setUp: Opening database...")
+        // Open database if not already open (will throw if already open, that's fine)
+        do {
+            try dbManager.open()
+            print("setUp: Database opened successfully")
+        } catch {
+            print("setUp: Database already open or error: \(error)")
+        }
+
+        print("setUp: Rebuilding database...")
+        // Clear all data before each test
+        do {
+            try dbManager.rebuildDatabase()
+            print("setUp: Database rebuilt")
+        } catch {
+            print("setUp: Failed to rebuild: \(error)")
+        }
     }
 
-    override func tearDown() async throws {
-        dbManager.close()
+    override func tearDown() {
+        // Don't close the database - we're using a shared singleton
+        // Just clean up the data
+        try? dbManager.rebuildDatabase()
+        super.tearDown()
     }
 
-    func testDatabaseCreation() throws {
+    func testDatabaseCreation() async throws {
         // Database should be created with version 1
-        let count = try dbManager.getFileCount()
-        XCTAssertEqual(count, 0, "New database should have no files")
+        print("Testing database creation...")
+        let count = try await dbManager.getFileCount()
+        print("File count: \(count)")
+        XCTAssertEqual(count, 0, "New database should have no files, but got \(count)")
     }
 
-    func testBatchInsert() throws {
+    func testBatchInsert() async throws {
         // Create test records
         var records: [FileRecordInsert] = []
         for i in 1...1000 {
@@ -47,7 +69,7 @@ final class DatabaseTests: XCTestCase {
         try dbManager.insertFiles(records)
 
         // Verify count
-        let count = try dbManager.getFileCount()
+        let count = try await dbManager.getFileCount()
         XCTAssertEqual(count, 1000, "Should have inserted 1000 files")
 
         // Verify count by volume
@@ -55,7 +77,7 @@ final class DatabaseTests: XCTestCase {
         XCTAssertEqual(volumeCount, 1000, "Should have 1000 files for test volume")
     }
 
-    func testLargeBatchInsert() throws {
+    func testLargeBatchInsert() async throws {
         // Test with more than batch size (10,000)
         var records: [FileRecordInsert] = []
         for i in 1...25000 {
@@ -77,14 +99,14 @@ final class DatabaseTests: XCTestCase {
 
         print("Inserted 25,000 records in \(elapsed) seconds")
 
-        let count = try dbManager.getFileCount()
+        let count = try await dbManager.getFileCount()
         XCTAssertEqual(count, 25000, "Should have inserted 25,000 files")
 
         // Verify batching worked (should be fast)
         XCTAssertLessThan(elapsed, 5.0, "Should insert 25k records in under 5 seconds")
     }
 
-    func testRebuildDatabase() throws {
+    func testRebuildDatabase() async throws {
         // Insert some data
         let records = [
             FileRecordInsert(
@@ -100,14 +122,44 @@ final class DatabaseTests: XCTestCase {
         ]
         try dbManager.insertFiles(records)
 
-        var count = try dbManager.getFileCount()
+        var count = try await dbManager.getFileCount()
         XCTAssertEqual(count, 1)
 
         // Rebuild
         try dbManager.rebuildDatabase()
 
         // Should be empty
-        count = try dbManager.getFileCount()
+        count = try await dbManager.getFileCount()
         XCTAssertEqual(count, 0, "Database should be empty after rebuild")
+    }
+
+    func testDatabasePragmaSettings() throws {
+        // Test that all PRAGMA settings are applied correctly
+        let pragmaSettings = try dbManager.getPragmaSettings()
+
+        // Verify WAL mode
+        XCTAssertEqual(pragmaSettings["journal_mode"], "wal", "Journal mode should be WAL")
+
+        // Verify synchronous mode
+        XCTAssertEqual(pragmaSettings["synchronous"], "1", "Synchronous should be NORMAL (1)")
+
+        // Verify cache size (should be negative for KB)
+        if let cacheSize = pragmaSettings["cache_size"], let cacheSizeInt = Int(cacheSize) {
+            XCTAssertLessThan(cacheSizeInt, 0, "Cache size should be negative (in KB)")
+            XCTAssertLessThanOrEqual(cacheSizeInt, -50000, "Cache size should be at least 50MB")
+        } else {
+            XCTFail("Cache size not set")
+        }
+
+        // Verify temp store
+        XCTAssertEqual(pragmaSettings["temp_store"], "2", "Temp store should be MEMORY (2)")
+
+        // Verify foreign keys
+        XCTAssertEqual(pragmaSettings["foreign_keys"], "1", "Foreign keys should be ON (1)")
+
+        print("PRAGMA settings verified:")
+        for (key, value) in pragmaSettings.sorted(by: { $0.key < $1.key }) {
+            print("  \(key) = \(value)")
+        }
     }
 }

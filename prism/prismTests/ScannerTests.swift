@@ -83,7 +83,7 @@ final class ScannerTests: XCTestCase {
         }
 
         // Check that files were indexed
-        let fileCount = try dbManager.getFileCount()
+        let fileCount = try await dbManager.getFileCount()
         XCTAssertGreaterThan(fileCount, 0, "Should have indexed at least some files, got \(fileCount)")
     }
 
@@ -101,7 +101,7 @@ final class ScannerTests: XCTestCase {
         try await scanner.scanVolume(path: testDirectory.path)
         let elapsed = Date().timeIntervalSince(startTime)
 
-        let fileCount = try dbManager.getFileCount()
+        let fileCount = try await dbManager.getFileCount()
         XCTAssertEqual(fileCount, 125, "Should have indexed 125 files")
 
         print("Scanned and indexed 125 files in \(elapsed) seconds")
