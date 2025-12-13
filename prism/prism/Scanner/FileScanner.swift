@@ -20,7 +20,7 @@ final class FileScanner {
 
     private var isCancelled = false
     private let progressInterval = 50 // Report every N files for better feedback
-    private let batchSize = 2000 // Larger batches for better performance
+    private let batchSize = 500 // Smaller batches to reduce write lock time and keep UI responsive
 
     // Audio file extensions to index
     private let audioExtensions: Set<String> = [
@@ -54,6 +54,9 @@ final class FileScanner {
 
         while !queue.isEmpty && !isCancelled {
             let currentURL = queue.removeFirst()
+
+            // Yield at the start of each directory to allow UI updates
+            await Task.yield()
 
             // Report directory being scanned
             progressCallback?(scannedCount, currentURL.lastPathComponent)
@@ -125,8 +128,13 @@ final class FileScanner {
 
                             // Insert batch when it reaches size
                             if batch.count >= batchSize {
+                                // Insert the batch synchronously to maintain data integrity
                                 try dbManager.insertFiles(batch)
                                 batch.removeAll(keepingCapacity: true)
+
+                                // Yield to allow UI updates and other tasks to run
+                                // This is critical for keeping the UI responsive
+                                await Task.yield()
 
                                 // Report progress after each batch insert
                                 progressCallback?(scannedCount, currentURL.path)
@@ -134,6 +142,8 @@ final class FileScanner {
 
                             // Report progress more frequently
                             if scannedCount % progressInterval == 0 {
+                                // Yield periodically even between batches
+                                await Task.yield()
                                 progressCallback?(scannedCount, currentURL.path)
                             }
                         }

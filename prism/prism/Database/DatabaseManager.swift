@@ -39,10 +39,12 @@ final class DatabaseManager {
         // Configure database pool for optimal concurrency
         var config = Configuration()
 
-        // MAX PERFORMANCE: Prepare the connection
+        // MAX PERFORMANCE: Prepare EACH connection (runs for every connection in the pool)
+        // This is critical - prepareDatabase runs ONCE PER CONNECTION, not once globally
         config.prepareDatabase { db in
-            // KEY CONFIG #1: WAL Mode (automatic in DatabasePool, but explicit here)
+            // KEY CONFIG #1: WAL Mode
             // Allows reading while writing - critical for UI responsiveness
+            // Note: This only needs to be set once, but it's safe to call repeatedly
             try db.execute(sql: "PRAGMA journal_mode=WAL")
 
             // KEY CONFIG #2: Synchronous = NORMAL
@@ -52,16 +54,26 @@ final class DatabaseManager {
 
             // KEY CONFIG #3: Cache Size
             // Use ~50MB of RAM for caching pages to speed up searching
-            // (Negative number = kilobytes)
+            // Negative number = kilobytes
             try db.execute(sql: "PRAGMA cache_size=-50000")
 
             // KEY CONFIG #4: Temp Store
             // Store temporary indices in RAM, not on disk
             try db.execute(sql: "PRAGMA temp_store=MEMORY")
 
-            // Enable foreign keys
+            // KEY CONFIG #5: Foreign Keys
+            // Must be enabled on every connection
             try db.execute(sql: "PRAGMA foreign_keys=ON")
+
+            // KEY CONFIG #6: Busy Timeout
+            // Wait up to 100ms if database is locked, then fail fast
+            // This prevents UI freezing by not blocking indefinitely
+            try db.execute(sql: "PRAGMA busy_timeout=100")
         }
+
+        // KEY CONFIG #7: Set read-only transaction deferred mode
+        // This allows multiple readers to coexist with a writer
+        config.defaultTransactionKind = .deferred
 
         // USE A POOL, NOT A QUEUE
         // DatabasePool manages concurrent Reader/Writer threads automatically
@@ -215,16 +227,19 @@ final class DatabaseManager {
     /// Delete all data and reset schema (for rebuild operations)
     func rebuildDatabase() throws {
         try dbPool.write { db in
-            // Drop all tables
+            // Drop all tables and triggers
             try db.execute(sql: "DROP TABLE IF EXISTS audio_metadata;")
             try db.execute(sql: "DROP TRIGGER IF EXISTS files_au;")
             try db.execute(sql: "DROP TRIGGER IF EXISTS files_ad;")
             try db.execute(sql: "DROP TRIGGER IF EXISTS files_ai;")
             try db.execute(sql: "DROP TABLE IF EXISTS files_fts;")
             try db.execute(sql: "DROP TABLE IF EXISTS files;")
+
+            // Drop migration tracking table so migrations can run again
+            try db.execute(sql: "DROP TABLE IF EXISTS grdb_migrations;")
         }
 
-        // Re-run migrations
+        // Re-run migrations (will recreate all tables)
         try handleMigrations()
     }
 
@@ -240,6 +255,21 @@ final class DatabaseManager {
     func getFileCount() async throws -> Int {
         try await dbPool.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
+        }
+    }
+
+    /// Get current PRAGMA settings for verification
+    func getPragmaSettings() throws -> [String: String] {
+        try dbPool.read { db in
+            var settings: [String: String] = [:]
+
+            settings["journal_mode"] = try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? ""
+            settings["synchronous"] = try String.fetchOne(db, sql: "PRAGMA synchronous") ?? ""
+            settings["cache_size"] = try String.fetchOne(db, sql: "PRAGMA cache_size") ?? ""
+            settings["temp_store"] = try String.fetchOne(db, sql: "PRAGMA temp_store") ?? ""
+            settings["foreign_keys"] = try String.fetchOne(db, sql: "PRAGMA foreign_keys") ?? ""
+
+            return settings
         }
     }
 
