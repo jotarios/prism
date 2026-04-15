@@ -22,7 +22,7 @@ struct FileRecord: Identifiable {
 }
 
 /// Minimal record for insertion during scanning
-struct FileRecordInsert {
+struct FileRecordInsert: Sendable {
     let filename: String
     let path: String
     let volumeUUID: String

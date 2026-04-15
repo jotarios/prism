@@ -149,31 +149,27 @@ struct VolumeSettingsRow: View {
     private func clearVolume() {
         Task {
             do {
-                try DatabaseManager.shared.deleteFilesByVolume(volume.uuid)
+                try viewModel.clearVolumeFiles(volume.uuid)
                 await loadFileCount()
-
-                // Refresh search results immediately
                 await viewModel.performSearch(viewModel.searchQuery)
-
-                // Update total count
-                let totalCount = try await DatabaseManager.shared.getFileCount()
+                let totalCount = try viewModel.getStoredFileCount()
                 await MainActor.run {
                     viewModel.totalFilesIndexed = totalCount
                 }
             } catch {
-                print("Failed to clear volume \(volume.name): \(error)")
+                Log.error("Failed to clear volume \(volume.name): \(error)")
             }
         }
     }
 
     private func loadFileCount() async {
         do {
-            let count = try DatabaseManager.shared.getFileCountByVolume(volume.uuid)
+            let count = try viewModel.getVolumeFileCount(volume.uuid)
             await MainActor.run {
                 self.fileCount = count
             }
         } catch {
-            print("Failed to get file count for volume \(volume.name): \(error)")
+            Log.error("Failed to get file count for volume \(volume.name): \(error)")
         }
     }
 }

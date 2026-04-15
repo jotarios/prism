@@ -51,7 +51,7 @@ final class VolumeManager {
 
                 volumes.append(volumeInfo)
             } catch {
-                print("Error reading volume info for \(url.path): \(error)")
+                Log.error("Error reading volume info for \(url.path): \(error)")
                 continue
             }
         }
@@ -67,7 +67,7 @@ final class VolumeManager {
             let resourceValues = try url.resourceValues(forKeys: [.volumeUUIDStringKey])
             return resourceValues.volumeUUIDString
         } catch {
-            print("Error getting volume UUID for \(path): \(error)")
+            Log.error("Error getting volume UUID for \(path): \(error)")
             return nil
         }
     }
