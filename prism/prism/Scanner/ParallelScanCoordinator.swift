@@ -17,38 +17,6 @@ actor ParallelScanCoordinator {
         self.maxConcurrency = maxConcurrency
     }
 
-    func scan(progress: @escaping (Int, String) async -> Void) async throws -> [ScannedFile] {
-        var allFiles: [ScannedFile] = []
-        var directoryQueue: [String] = [rootPath]
-        var inFlight = 0
-
-        try await withThrowingTaskGroup(of: DirectoryScanResult.self) { group in
-            while !directoryQueue.isEmpty && inFlight < maxConcurrency {
-                let dir = directoryQueue.removeFirst()
-                inFlight += 1
-                group.addTask { BulkScanner.scanDirectory(atPath: dir) }
-            }
-
-            for try await result in group {
-                inFlight -= 1
-                allFiles.append(contentsOf: result.audioFiles)
-                directoryQueue.append(contentsOf: result.subdirectories)
-
-                while !directoryQueue.isEmpty && inFlight < maxConcurrency && !isCancelled {
-                    let dir = directoryQueue.removeFirst()
-                    inFlight += 1
-                    group.addTask { BulkScanner.scanDirectory(atPath: dir) }
-                }
-
-                if allFiles.count % 500 < result.audioFiles.count {
-                    await progress(allFiles.count, result.audioFiles.first?.parentPath ?? "")
-                }
-            }
-        }
-
-        return allFiles
-    }
-
     func scanStreaming(into store: DuckDBStore, progress: @escaping (Int, String) async -> Void) async throws -> Int {
         let writerBatchSize = 5000
         let (stream, continuation) = AsyncStream<[ScannedFile]>.makeStream(bufferingPolicy: .bufferingNewest(64))

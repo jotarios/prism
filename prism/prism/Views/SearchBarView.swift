@@ -7,7 +7,7 @@ import SwiftUI
 
 struct SearchBarView: View {
     @ObservedObject var viewModel: SearchViewModel
-    @FocusState private var isSearchFocused: Bool
+    @FocusState.Binding var isSearchFocused: Bool
 
     var body: some View {
         HStack {
@@ -44,8 +44,15 @@ struct SearchBarView: View {
     }
 }
 
+private struct SearchBarPreview: View {
+    @FocusState var focused: Bool
+    var body: some View {
+        SearchBarView(viewModel: SearchViewModel.shared, isSearchFocused: $focused)
+            .padding()
+            .frame(width: 600)
+    }
+}
+
 #Preview {
-    SearchBarView(viewModel: SearchViewModel.shared)
-        .padding()
-        .frame(width: 600)
+    SearchBarPreview()
 }

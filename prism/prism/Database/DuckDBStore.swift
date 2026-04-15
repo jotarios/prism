@@ -120,18 +120,6 @@ final class DuckDBStore {
         cache.values
     }
 
-    func getAllFileIDs(limit: Int = 10_000) throws -> [Int64] {
-        let stmt = try PreparedStatement(connection: connection, query: "SELECT id FROM files ORDER BY date_modified DESC LIMIT $1")
-        try stmt.bind(Int64(limit), at: 1)
-        let result = try stmt.execute()
-        let col = result[0].cast(to: Int64.self)
-        var ids: [Int64] = []
-        for idx in 0..<result.rowCount {
-            if let id = col[idx] { ids.append(id) }
-        }
-        return ids
-    }
-
     func getFilesByIDs(_ ids: [Int64]) throws -> [SearchResult] {
         guard !ids.isEmpty else { return [] }
         if cacheLoaded {

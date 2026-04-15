@@ -52,6 +52,7 @@ class SearchViewModel: ObservableObject {
         }
 
         searchDebounce = $searchQuery
+            .removeDuplicates()
             .debounce(for: .milliseconds(150), scheduler: RunLoop.main)
             .sink { [weak self] query in
                 self?.searchTask?.cancel()

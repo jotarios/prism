@@ -5,7 +5,6 @@
 
 import SwiftUI
 import AppKit
-import Quartz
 
 struct ResultsTableView: View {
     @ObservedObject var viewModel: SearchViewModel
@@ -33,7 +32,6 @@ struct ResultsTableView: View {
 
     private var resultsTable: some View {
         createTable()
-            .id(viewModel.resultsUpdateID)
             .contextMenu(forSelectionType: SearchResult.ID.self) { items in
                 contextMenuContent(for: items)
             } primaryAction: { items in
