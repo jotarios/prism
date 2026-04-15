@@ -205,6 +205,40 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [ ] **Phase 5**: Advanced filters, offline drive handling
 - [ ] **Phase 6**: Semantic search — query by mood, genre, or concept ("sad songs", "workout music"). ID3 genre/mood tags + filename-based artist lookup + optional local LLM enrichment for untagged files. Hybrid approach: three tiers of coverage depending on available metadata
 
+## Architecture TODOs
+
+Known limitations and planned improvements from internal review. Ordered by impact.
+
+### Concurrency & throughput
+
+- [ ] **Multi-connection DuckDB (1 writer + N readers)** — today a single `NSLock`-protected `Connection` serializes every read/write, so search blocks on `ingestBatch` during a scan. Open dedicated reader connections and drop the lock to reader-writer semantics. Biggest UX win: search-during-scan.
+- [ ] **Unblock search during active scans** — until multi-connection lands, route search through a read-only snapshot or disable the search bar with a clear UI affordance instead of queuing behind the ingest writer.
+- [ ] **Cancellable scan workers** — `ParallelScanCoordinator.cancel()` only checks between task-group iterations; in-flight `BulkScanner.scanDirectory` blocking syscalls run to completion. Cancel is currently "eventually stops," not "stops now."
+- [ ] **Backpressured AsyncStream (SE-0406)** — current stream uses `.unbounded`, which is correct but lets RAM grow if the DuckDB writer stalls. Migrate once the Swift version allows.
+
+### Indexing
+
+- [ ] **Incremental FTS5 sync** — `syncSearchIndex` currently drops and rebuilds the entire FTS5 index on every scan (O(N)). Tag rows with a `scan_generation` and sync only diffs. Matters a lot at 5M files.
+- [ ] **Shard DuckDB by volume** — one `.duckdb` file per volume UUID. Natural partitioning, parallel ingest across volumes, and detaching an offline drive becomes a file-level operation.
+- [ ] **Evaluate SQLite-only ingestion path** — DuckDB's Appender is fast but SQLite WAL + prepared statements may be close enough to drop DuckDB from the ingestion hot path and keep it for analytics only.
+
+### Memory
+
+- [ ] **Bounded / LRU result cache** — `loadCache` eagerly reads every row into `[Int64: SearchResult]`. At 5M files × ~200 B/entry ≈ 1 GB resident with no eviction. Switch to a bounded LRU keyed by the most recent FTS5 result sets, or drop the cache tier and benchmark end-to-end.
+
+### Code organization
+
+- [ ] **Split `SearchViewModel`** — ~230-line `@MainActor` god object owning volumes, DBs, scan pipeline, FTS sync, and search. Split into:
+  - `IndexService` (non-MainActor actor): owns the stores, scan pipeline, FTS sync.
+  - `SearchService` (actor): query + cache.
+  - Thin `@MainActor SearchViewModel`: holds only `@Published` UI state.
+  - Eliminates the `await MainActor.run { self.duckDBStore }` hops that are a symptom of isolation mismatch.
+
+### Testing
+
+- [ ] **Fix stale test suites** — `ScannerTests` / `ParallelScanCoordinatorTests` referenced a removed `scan(...)` API (since re-added as a collect-only overload). Audit remaining test files for drift against current APIs.
+- [ ] **Concurrency stress tests** — add a test that runs a scan and a flood of searches concurrently to lock in the DuckDB serialization invariant and detect future regressions.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details

@@ -165,39 +165,57 @@ final class DatabaseManager {
     // MARK: - Sync from DuckDB
 
     func syncSearchIndex(from store: DuckDBStore) throws {
-        try beginBulkImport()
-
-        do {
-            try dbPool.write { db in
-                try db.execute(sql: "DELETE FROM files")
-            }
-
-            try store.iterateAllForSync { batch in
-                try self.insertSyncBatch(batch)
-            }
-
-            try endBulkImport()
-
-            let sqliteCount = try dbPool.read { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
-            }
-            let duckdbCount = try store.getFileCount()
-
-            if sqliteCount != duckdbCount {
-                Log.error("Sync mismatch: SQLite=\(sqliteCount) DuckDB=\(duckdbCount)")
-            }
-        } catch {
-            try? endBulkImport()
-            throw error
+        // Snapshot all records from DuckDB first (outside the SQLite transaction
+        // so we don't hold a write lock while reading from the other DB).
+        var allRecords: [SyncRecord] = []
+        try store.iterateAllForSync { batch in
+            allRecords.append(contentsOf: batch)
         }
-    }
 
-    private func insertSyncBatch(_ records: [SyncRecord]) throws {
+        // Perform the entire replacement — drop triggers, wipe files, bulk
+        // insert, restore triggers, rebuild FTS5 — inside a single write
+        // transaction. Any failure rolls back to the previous good state.
         try dbPool.write { db in
+            try db.execute(sql: "DROP TRIGGER IF EXISTS files_ai")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS files_ad")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS files_au")
+
+            try db.execute(sql: "DELETE FROM files")
+
             let stmt = try db.cachedStatement(sql: "INSERT OR REPLACE INTO files (id, filename, extension) VALUES (?, ?, ?)")
-            for record in records {
+            for record in allRecords {
                 try stmt.execute(arguments: [record.id, record.filename, record.ext])
             }
+
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+                    INSERT INTO files_fts(rowid, filename, extension)
+                    VALUES (new.id, new.filename, new.extension);
+                END
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
+                    VALUES('delete', old.id, old.filename, old.extension);
+                END
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
+                    VALUES('delete', old.id, old.filename, old.extension);
+                    INSERT INTO files_fts(rowid, filename, extension)
+                    VALUES (new.id, new.filename, new.extension);
+                END
+            """)
+            try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+        }
+
+        let sqliteCount = try dbPool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
+        }
+        let duckdbCount = try store.getFileCount()
+        if sqliteCount != duckdbCount {
+            Log.error("Sync mismatch: SQLite=\(sqliteCount) DuckDB=\(duckdbCount)")
         }
     }
 
