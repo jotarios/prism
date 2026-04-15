@@ -28,27 +28,32 @@ class SearchViewModel: ObservableObject {
     private init() {
         loadVolumes()
 
-        do {
-            try dbManager.open()
-            Log.debug("SQLite opened")
-        } catch {
-            Log.error("SQLite open failed: \(error)")
-        }
-
-        do {
-            let store = try DuckDBStore()
-            self.duckDBStore = store
-            self.totalFilesIndexed = (try? store.getFileCount()) ?? 0
-            if totalFilesIndexed > 0 {
-                try? store.loadCache()
+        // Open databases off the main thread so cold-start doesn't block
+        // the first window paint on large metadata files.
+        Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                try self.dbManager.open()
+                Log.debug("SQLite opened")
+            } catch {
+                Log.error("SQLite open failed: \(error)")
             }
-            Log.debug("DuckDB opened at \(store.dbPath), \(totalFilesIndexed) files")
-        } catch {
-            Log.error("DuckDB open failed: \(error)")
-        }
 
-        Task {
-            await self.performSearch("")
+            do {
+                let store = try DuckDBStore()
+                let count = (try? store.getFileCount()) ?? 0
+                if count > 0 {
+                    try? store.loadCache()
+                }
+                Log.debug("DuckDB opened at \(store.dbPath), \(count) files")
+                await MainActor.run {
+                    self.duckDBStore = store
+                    self.totalFilesIndexed = count
+                }
+                await self.performSearch("")
+            } catch {
+                Log.error("DuckDB open failed: \(error)")
+            }
         }
 
         searchDebounce = $searchQuery
@@ -156,16 +161,12 @@ class SearchViewModel: ObservableObject {
                 }
 
                 let postStart = CFAbsoluteTimeGetCurrent()
-                async let syncResult: () = Task.detached {
-                    try self.dbManager.syncSearchIndex(from: store)
-                }.value
-                async let cacheResult: () = Task.detached {
-                    try store.loadCache()
-                }.value
-                try await syncResult
-                try await cacheResult
+                // DuckDBStore serializes access through its internal lock, so
+                // run these sequentially to avoid self-contention.
+                try self.dbManager.syncSearchIndex(from: store)
+                try store.loadCache()
                 let postTime = CFAbsoluteTimeGetCurrent() - postStart
-                Log.debug("FTS5 sync + cache (parallel): \(String(format: "%.2f", postTime))s")
+                Log.debug("FTS5 sync + cache: \(String(format: "%.2f", postTime))s")
 
                 let totalTime = CFAbsoluteTimeGetCurrent() - pipelineStart
                 Log.debug("Total pipeline: \(String(format: "%.2f", totalTime))s for \(totalFiles) files (\(String(format: "%.0f", Double(totalFiles) / max(totalTime, 0.001))) files/sec)")

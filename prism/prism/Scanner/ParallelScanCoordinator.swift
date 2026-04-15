@@ -17,12 +17,12 @@ actor ParallelScanCoordinator {
         self.maxConcurrency = maxConcurrency
     }
 
-    func scanStreaming(into store: DuckDBStore, progress: @escaping (Int, String) async -> Void) async throws -> Int {
-        let writerBatchSize = 5000
-        let (stream, continuation) = AsyncStream<[ScannedFile]>.makeStream(bufferingPolicy: .bufferingNewest(64))
-
+    private func makeProducerStream() -> (AsyncStream<[ScannedFile]>, Task<Void, Error>) {
+        let (stream, continuation) = AsyncStream<[ScannedFile]>.makeStream(bufferingPolicy: .unbounded)
         let cancelCheck = { self.isCancelled }
         let producerTask = Task { [rootPath, maxConcurrency] in
+            defer { continuation.finish() }
+
             var directoryQueue: [String] = [rootPath]
             var inFlight = 0
 
@@ -50,8 +50,26 @@ actor ParallelScanCoordinator {
                     if cancelled { break }
                 }
             }
-            continuation.finish()
         }
+        return (stream, producerTask)
+    }
+
+    /// Collect-only scan: returns all discovered files in one array. Intended
+    /// for tests and benchmarks that don't want to round-trip through DuckDB.
+    func scan(progress: @escaping (Int, String) async -> Void) async throws -> [ScannedFile] {
+        let (stream, producerTask) = makeProducerStream()
+        var all: [ScannedFile] = []
+        for await files in stream {
+            all.append(contentsOf: files)
+            await progress(all.count, files.first?.parentPath ?? "")
+        }
+        try await producerTask.value
+        return all
+    }
+
+    func scanStreaming(into store: DuckDBStore, progress: @escaping (Int, String) async -> Void) async throws -> Int {
+        let writerBatchSize = 5000
+        let (stream, producerTask) = makeProducerStream()
 
         var totalFiles = 0
         var writeBatch: [ScannedFile] = []

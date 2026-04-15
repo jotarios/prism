@@ -34,7 +34,8 @@ final class BulkScanner {
         ".fseventsd", ".TemporaryItems"
     ]
 
-    private static let bufferSize = 256 * 1024
+    private static let initialBufferSize = 256 * 1024
+    private static let maxBufferSize = 8 * 1024 * 1024
 
     static func scanDirectory(atPath path: String) -> DirectoryScanResult {
         let fd = open(path, O_RDONLY | O_DIRECTORY)
@@ -54,24 +55,29 @@ final class BulkScanner {
             attrgroup_t(bitPattern: ATTR_CMN_MODTIME)
         attrList.fileattr = attrgroup_t(bitPattern: ATTR_FILE_DATALENGTH)
 
-        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 8)
+        var bufferSize = initialBufferSize
+        var buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 8)
         defer { buffer.deallocate() }
 
         var audioFiles: [ScannedFile] = []
         var subdirectories: [String] = []
 
-        var erangeRetried = false
         while true {
             let count = getattrlistbulk(fd, &attrList, buffer, bufferSize, 0)
             if count == 0 { break }
             if count < 0 {
-                if errno == ERANGE && !erangeRetried {
-                    erangeRetried = true
+                // ERANGE means a single entry didn't fit the buffer. Grow it
+                // (up to maxBufferSize) and retry. Same-size retry would just
+                // loop forever and silently truncate the directory.
+                if errno == ERANGE && bufferSize < maxBufferSize {
+                    buffer.deallocate()
+                    bufferSize = min(bufferSize * 2, maxBufferSize)
+                    buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 8)
                     continue
                 }
+                Log.error("getattrlistbulk failed at \(path): errno=\(errno)")
                 break
             }
-            erangeRetried = false
 
             var ptr = buffer
             for _ in 0..<count {
