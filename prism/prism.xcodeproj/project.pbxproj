@@ -8,6 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		963E525E2ED2DECA00BCA06F /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 963E525D2ED2DECA00BCA06F /* GRDB */; };
+		AA0001012EDE000000000001 /* DuckDB in Frameworks */ = {isa = PBXBuildFile; productRef = AA0001002EDE000000000001 /* DuckDB */; };
+		AA0001032EDE000000000002 /* DuckDB in Frameworks */ = {isa = PBXBuildFile; productRef = AA0001022EDE000000000002 /* DuckDB */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +59,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				963E525E2ED2DECA00BCA06F /* GRDB in Frameworks */,
+				AA0001012EDE000000000001 /* DuckDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -64,6 +67,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0001032EDE000000000002 /* DuckDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -118,6 +122,7 @@
 			name = prism;
 			packageProductDependencies = (
 				963E525D2ED2DECA00BCA06F /* GRDB */,
+				AA0001002EDE000000000001 /* DuckDB */,
 			);
 			productName = prism;
 			productReference = 963E51F02ED2C2A800BCA06F /* prism.app */;
@@ -141,6 +146,7 @@
 			);
 			name = prismTests;
 			packageProductDependencies = (
+				AA0001022EDE000000000002 /* DuckDB */,
 			);
 			productName = prismTests;
 			productReference = 963E51FF2ED2C2AA00BCA06F /* prismTests.xctest */;
@@ -203,6 +209,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				963E525C2ED2DEB300BCA06F /* XCRemoteSwiftPackageReference "GRDB" */,
+				AA0001042EDE000000000003 /* XCRemoteSwiftPackageReference "duckdb-swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 963E51F12ED2C2A800BCA06F /* Products */;
@@ -592,6 +599,14 @@
 				minimumVersion = 6.29.3;
 			};
 		};
+		AA0001042EDE000000000003 /* XCRemoteSwiftPackageReference "duckdb-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/duckdb/duckdb-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.1.3;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -599,6 +614,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 963E525C2ED2DEB300BCA06F /* XCRemoteSwiftPackageReference "GRDB" */;
 			productName = GRDB;
+		};
+		AA0001002EDE000000000001 /* DuckDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA0001042EDE000000000003 /* XCRemoteSwiftPackageReference "duckdb-swift" */;
+			productName = DuckDB;
+		};
+		AA0001022EDE000000000002 /* DuckDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA0001042EDE000000000003 /* XCRemoteSwiftPackageReference "duckdb-swift" */;
+			productName = DuckDB;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
