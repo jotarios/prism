@@ -77,28 +77,7 @@ final class DatabaseManager {
                 )
             """)
 
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                    INSERT INTO files_fts(rowid, filename, extension)
-                    VALUES (new.id, new.filename, new.extension);
-                END
-            """)
-
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
-                    VALUES('delete', old.id, old.filename, old.extension);
-                END
-            """)
-
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
-                    VALUES('delete', old.id, old.filename, old.extension);
-                    INSERT INTO files_fts(rowid, filename, extension)
-                    VALUES (new.id, new.filename, new.extension);
-                END
-            """)
+            try DatabaseManager.createFTS5Triggers(db)
 
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_extension ON files(extension)")
         }
@@ -115,6 +94,35 @@ final class DatabaseManager {
                 throw DatabaseError.corruptDatabase
             }
         }
+    }
+
+    // MARK: - FTS5 Trigger Definitions
+
+    /// Creates the three FTS5 sync triggers. Idempotent (`IF NOT EXISTS`).
+    /// Callers that need to drop-then-recreate should `DROP TRIGGER IF EXISTS`
+    /// first; this helper never drops.
+    /// Static so it can be called from migration closures without capturing self.
+    fileprivate static func createFTS5Triggers(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, filename, extension)
+                VALUES (new.id, new.filename, new.extension);
+            END
+        """)
+        try db.execute(sql: """
+            CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, filename, extension)
+                VALUES('delete', old.id, old.filename, old.extension);
+            END
+        """)
+        try db.execute(sql: """
+            CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, filename, extension)
+                VALUES('delete', old.id, old.filename, old.extension);
+                INSERT INTO files_fts(rowid, filename, extension)
+                VALUES (new.id, new.filename, new.extension);
+            END
+        """)
     }
 
     private func ensureTriggersExist() throws {
@@ -138,26 +146,7 @@ final class DatabaseManager {
 
     func endBulkImport() throws {
         try dbPool.write { db in
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                    INSERT INTO files_fts(rowid, filename, extension)
-                    VALUES (new.id, new.filename, new.extension);
-                END
-            """)
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
-                    VALUES('delete', old.id, old.filename, old.extension);
-                END
-            """)
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
-                    VALUES('delete', old.id, old.filename, old.extension);
-                    INSERT INTO files_fts(rowid, filename, extension)
-                    VALUES (new.id, new.filename, new.extension);
-                END
-            """)
+            try DatabaseManager.createFTS5Triggers(db)
             try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
         }
     }
@@ -187,26 +176,7 @@ final class DatabaseManager {
                 try stmt.execute(arguments: [record.id, record.filename, record.ext])
             }
 
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                    INSERT INTO files_fts(rowid, filename, extension)
-                    VALUES (new.id, new.filename, new.extension);
-                END
-            """)
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
-                    VALUES('delete', old.id, old.filename, old.extension);
-                END
-            """)
-            try db.execute(sql: """
-                CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, filename, extension)
-                    VALUES('delete', old.id, old.filename, old.extension);
-                    INSERT INTO files_fts(rowid, filename, extension)
-                    VALUES (new.id, new.filename, new.extension);
-                END
-            """)
+            try DatabaseManager.createFTS5Triggers(db)
             try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
         }
 
