@@ -80,7 +80,7 @@ final class IntegrationTests: XCTestCase {
         let duckDBCount = try duckDBStore.getFileCount()
         XCTAssertEqual(duckDBCount, 1500)
 
-        try dbManager.syncSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
 
         let sqliteCount = try await dbManager.getFileCount()
         XCTAssertEqual(sqliteCount, duckDBCount, "SQLite and DuckDB counts must match")
@@ -98,6 +98,59 @@ final class IntegrationTests: XCTestCase {
         }
     }
 
+    /// REGRESSION GUARD: rescanning an unchanged tree must be O(0) —
+    /// produces an empty diff and syncs in well under the per-scan budget.
+    /// This is the test that fails loudly if anyone accidentally reverts
+    /// the incremental path to a full rebuild.
+    func testBackToBackScanProducesEmptyDiff() async throws {
+        try createLargeTree()
+
+        let volumeUUID = VolumeManager.shared.getVolumeUUID(for: testDirectory.path) ?? "TEST"
+
+        // First scan — full cost, populates DuckDB + SQLite.
+        _ = try duckDBStore.beginScan(volumeUUID: volumeUUID)
+        let coord1 = ParallelScanCoordinator(
+            rootPath: testDirectory.path,
+            volumeUUID: volumeUUID,
+            maxConcurrency: 8
+        )
+        _ = try await coord1.scanStreaming(into: duckDBStore) { _, _ in }
+        let diff1 = try duckDBStore.mergeAndDiff(volumeUUID: volumeUUID)
+        try dbManager.syncSearchIndex(from: duckDBStore, volumeUUID: volumeUUID, diff: diff1)
+        XCTAssertEqual(diff1.added.count, 1500)
+        XCTAssertEqual(diff1.modified.count, 0)
+        XCTAssertEqual(diff1.removedIds.count, 0)
+
+        // Capture ids so we can prove stability.
+        let firstRowIds = try duckDBStore.getAllFiles(limit: 1500).map(\.id).sorted()
+
+        // Second scan — no filesystem changes.
+        _ = try duckDBStore.beginScan(volumeUUID: volumeUUID)
+        let coord2 = ParallelScanCoordinator(
+            rootPath: testDirectory.path,
+            volumeUUID: volumeUUID,
+            maxConcurrency: 8
+        )
+        _ = try await coord2.scanStreaming(into: duckDBStore) { _, _ in }
+
+        let mergeStart = CFAbsoluteTimeGetCurrent()
+        let diff2 = try duckDBStore.mergeAndDiff(volumeUUID: volumeUUID)
+        let mergeTime = CFAbsoluteTimeGetCurrent() - mergeStart
+
+        XCTAssertTrue(diff2.isEmpty, "Unchanged rescan must produce empty diff (added=\(diff2.added.count) modified=\(diff2.modified.count) removed=\(diff2.removedIds.count))")
+
+        let syncStart = CFAbsoluteTimeGetCurrent()
+        try dbManager.syncSearchIndex(from: duckDBStore, volumeUUID: volumeUUID, diff: diff2)
+        let syncTime = CFAbsoluteTimeGetCurrent() - syncStart
+
+        XCTAssertLessThan(syncTime, 0.1, "Empty-diff sync should be near-instant, was \(syncTime)s")
+        XCTAssertLessThan(mergeTime, 1.0, "Merge at 1500 rows should be well under a second, was \(mergeTime)s")
+
+        // ID stability: same ids, same order.
+        let secondRowIds = try duckDBStore.getAllFiles(limit: 1500).map(\.id).sorted()
+        XCTAssertEqual(firstRowIds, secondRowIds, "row ids must be byte-for-byte stable across unchanged rescan")
+    }
+
     func testFullPipelineBenchmark() async throws {
         try createLargeTree()
 
@@ -113,7 +166,7 @@ final class IntegrationTests: XCTestCase {
         let scanTime = CFAbsoluteTimeGetCurrent() - scanStart
 
         let syncStart = CFAbsoluteTimeGetCurrent()
-        try dbManager.syncSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
         let syncTime = CFAbsoluteTimeGetCurrent() - syncStart
 
         let searchStart = CFAbsoluteTimeGetCurrent()

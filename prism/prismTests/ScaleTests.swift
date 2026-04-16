@@ -72,7 +72,7 @@ final class ScaleTests: XCTestCase {
         try dbManager.rebuildDatabase()
 
         let syncStart = CFAbsoluteTimeGetCurrent()
-        try dbManager.syncSearchIndex(from: store)
+        try dbManager.rebuildSearchIndex(from: store)
         let syncTime = CFAbsoluteTimeGetCurrent() - syncStart
         output += "  FTS5 sync: \(String(format: "%.2f", syncTime))s\n"
 

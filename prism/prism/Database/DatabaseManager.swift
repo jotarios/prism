@@ -14,6 +14,14 @@ enum DatabaseError: Error {
     case syncMismatch(expected: Int, actual: Int)
 }
 
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
+}
+
 final class DatabaseManager {
     static let shared = DatabaseManager()
 
@@ -153,7 +161,10 @@ final class DatabaseManager {
 
     // MARK: - Sync from DuckDB
 
-    func syncSearchIndex(from store: DuckDBStore) throws {
+    /// Full rebuild of the SQLite search index from DuckDB. Used by Clear
+    /// Index / Rebuild Index and by first-time sync. Scan-time callers should
+    /// prefer `syncSearchIndex(from:volumeUUID:diff:)` which is O(delta).
+    func rebuildSearchIndex(from store: DuckDBStore) throws {
         // Snapshot all records from DuckDB first (outside the SQLite transaction
         // so we don't hold a write lock while reading from the other DB).
         var allRecords: [SyncRecord] = []
@@ -186,6 +197,57 @@ final class DatabaseManager {
         let duckdbCount = try store.getFileCount()
         if sqliteCount != duckdbCount {
             Log.error("Sync mismatch: SQLite=\(sqliteCount) DuckDB=\(duckdbCount)")
+        }
+    }
+
+    /// Incremental sync: apply a pre-computed `ScanDiff` to SQLite + FTS5 in
+    /// a single write transaction. Triggers stay in place; they propagate
+    /// each per-row change to FTS5 cheaply. Cost is O(|added ∪ modified ∪
+    /// removed|) rather than O(N).
+    ///
+    /// Callers: `SearchViewModel.scanVolume` after `DuckDBStore.mergeAndDiff`.
+    func syncSearchIndex(from store: DuckDBStore, volumeUUID: String, diff: ScanDiff) throws {
+        guard !diff.isEmpty else {
+            Log.debug("syncSearchIndex: empty diff for volume=\(volumeUUID), skipping")
+            return
+        }
+
+        try dbPool.write { db in
+            // DELETEs. Chunked at 500 to stay comfortably below SQLite's
+            // SQLITE_MAX_VARIABLE_NUMBER (default 32_766 in 3.32+, but older
+            // builds cap at 999; we keep headroom).
+            if !diff.removedIds.isEmpty {
+                for chunk in diff.removedIds.chunked(into: 500) {
+                    let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+                    try db.execute(
+                        sql: "DELETE FROM files WHERE id IN (\(placeholders))",
+                        arguments: StatementArguments(chunk)
+                    )
+                }
+            }
+
+            // INSERT OR REPLACE for added ∪ modified. The files_ai and
+            // files_au triggers handle FTS5 propagation row-by-row.
+            if !diff.added.isEmpty || !diff.modified.isEmpty {
+                let stmt = try db.cachedStatement(
+                    sql: "INSERT OR REPLACE INTO files (id, filename, extension) VALUES (?, ?, ?)"
+                )
+                for entry in diff.added {
+                    try stmt.execute(arguments: [entry.id, entry.filename, entry.ext])
+                }
+                for entry in diff.modified {
+                    try stmt.execute(arguments: [entry.id, entry.filename, entry.ext])
+                }
+            }
+        }
+
+        // Verification: SQLite rows for this volume should equal DuckDB rows.
+        let sqliteCount = try dbPool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
+        }
+        let duckdbCount = try store.getFileCount()
+        if sqliteCount != duckdbCount {
+            Log.error("Incremental sync mismatch: SQLite=\(sqliteCount) DuckDB=\(duckdbCount) (volume=\(volumeUUID))")
         }
     }
 

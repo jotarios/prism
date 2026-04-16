@@ -136,8 +136,13 @@ class SearchViewModel: ObservableObject {
 
                 let pipelineStart = CFAbsoluteTimeGetCurrent()
 
-                try store.deleteFilesByVolume(volume.uuid)
-                Log.debug("Cleared old data for volume \(volume.uuid)")
+                // Incremental flow: beginScan acquires the scan slot and stamps
+                // a fresh generation; ingestBatch (called by scanStreaming)
+                // writes into the per-volume staging table; mergeAndDiff
+                // identifies added/modified/removed vs existing `files` rows
+                // and returns the diff for SQLite/cache propagation.
+                let generation = try store.beginScan(volumeUUID: volume.uuid)
+                Log.debug("beginScan volume=\(volume.uuid) generation=\(generation)")
 
                 let concurrency = volume.isInternal ? 8 : 4
                 let coordinator = ParallelScanCoordinator(
@@ -161,12 +166,25 @@ class SearchViewModel: ObservableObject {
                 }
 
                 let postStart = CFAbsoluteTimeGetCurrent()
-                // DuckDBStore serializes access through its internal lock, so
-                // run these sequentially to avoid self-contention.
-                try self.dbManager.syncSearchIndex(from: store)
-                try store.loadCache()
+                let diff = try store.mergeAndDiff(volumeUUID: volume.uuid)
+                Log.debug("ScanDiff: added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
+
+                // First scan of a brand-new DuckDB produces a diff where
+                // every row is in `added` and the cache is empty. loadCache
+                // is still the cheapest path in that case.
+                if !diff.isEmpty {
+                    try self.dbManager.syncSearchIndex(from: store, volumeUUID: volume.uuid, diff: diff)
+                    try store.applyDiff(diff)
+                }
+
+                // If the cache was never loaded (cold start, first scan),
+                // applyDiff is a no-op. Do a one-time full load.
+                if store.getAllCachedValues().isEmpty && (try? store.getFileCount()) ?? 0 > 0 {
+                    try store.loadCache()
+                }
+
                 let postTime = CFAbsoluteTimeGetCurrent() - postStart
-                Log.debug("FTS5 sync + cache: \(String(format: "%.2f", postTime))s")
+                Log.debug("FTS5 sync + cache (incremental): \(String(format: "%.2f", postTime))s")
 
                 let totalTime = CFAbsoluteTimeGetCurrent() - pipelineStart
                 Log.debug("Total pipeline: \(String(format: "%.2f", totalTime))s for \(totalFiles) files (\(String(format: "%.0f", Double(totalFiles) / max(totalTime, 0.001))) files/sec)")
@@ -199,7 +217,8 @@ class SearchViewModel: ObservableObject {
     func clearVolumeFiles(_ volumeUUID: String) throws {
         try duckDBStore?.deleteFilesByVolume(volumeUUID)
         if let store = duckDBStore {
-            try dbManager.syncSearchIndex(from: store)
+            // Clear Index is a full-rebuild operation by design.
+            try dbManager.rebuildSearchIndex(from: store)
         }
         results = []
         resultsUpdateID = UUID()

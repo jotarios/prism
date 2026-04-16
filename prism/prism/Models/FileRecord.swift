@@ -33,6 +33,27 @@ struct FileRecordInsert: Sendable {
     let isOnline: Bool
 }
 
+/// Diff produced by a scan: rows added, rows whose content changed, and rows
+/// that vanished. Lets `DatabaseManager.syncSearchIndex(from:volumeUUID:diff:)`
+/// propagate only the delta to SQLite/FTS5 and the in-memory cache.
+struct ScanDiff: Sendable {
+    /// Subset of fields sync needs, carried alongside the id so the sync step
+    /// doesn't re-round-trip DuckDB.
+    struct Entry: Sendable {
+        let id: Int64
+        let filename: String
+        let ext: String
+    }
+
+    let added: [Entry]
+    let modified: [Entry]
+    let removedIds: [Int64]
+
+    var isEmpty: Bool { added.isEmpty && modified.isEmpty && removedIds.isEmpty }
+
+    static let empty = ScanDiff(added: [], modified: [], removedIds: [])
+}
+
 /// Search result record optimized for display
 struct SearchResult: Identifiable, Equatable {
     let id: Int64
