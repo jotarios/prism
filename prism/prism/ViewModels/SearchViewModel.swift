@@ -136,13 +136,12 @@ class SearchViewModel: ObservableObject {
 
                 let pipelineStart = CFAbsoluteTimeGetCurrent()
 
-                // Incremental flow: beginScan acquires the scan slot and stamps
-                // a fresh generation; ingestBatch (called by scanStreaming)
-                // writes into the per-volume staging table; mergeAndDiff
-                // identifies added/modified/removed vs existing `files` rows
-                // and returns the diff for SQLite/cache propagation.
-                let generation = try store.beginScan(volumeUUID: volume.uuid)
-                Log.debug("beginScan volume=\(volume.uuid) generation=\(generation)")
+                // Incremental flow: beginScan acquires the scan slot;
+                // ingestBatch (called by scanStreaming) writes into the
+                // per-volume staging table; mergeAndDiff identifies
+                // added/modified/removed vs existing `files` rows and
+                // returns the diff for SQLite/cache propagation.
+                try store.beginScan(volumeUUID: volume.uuid)
 
                 let concurrency = volume.isInternal ? 8 : 4
                 let coordinator = ParallelScanCoordinator(
@@ -153,9 +152,12 @@ class SearchViewModel: ObservableObject {
                 Log.debug("Scanning with \(concurrency) workers (\(volume.isInternal ? "internal" : "external") drive)")
 
                 let scanStart = CFAbsoluteTimeGetCurrent()
-                let totalFiles = try await coordinator.scanStreaming(into: store) { count, path in
+                let totalFiles = try await coordinator.scanStreaming(into: store) { count, dirs, path in
+                    let dirName = (path as NSString).lastPathComponent
+                    let suffix = dirName.isEmpty ? "" : " • \(dirName)"
+                    let label = "Scanning: \(dirs) dirs, \(count) audio files\(suffix)"
                     await MainActor.run {
-                        self.scanProgress = "Scanning: \(count) audio files found..."
+                        self.scanProgress = label
                     }
                 }
                 let scanTime = CFAbsoluteTimeGetCurrent() - scanStart

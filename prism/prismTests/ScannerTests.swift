@@ -60,7 +60,7 @@ final class ScannerTests: XCTestCase {
             rootPath: testDirectory.path,
             volumeUUID: "TEST-UUID"
         )
-        let files = try await coordinator.scan { _, _ in }
+        let files = try await coordinator.scan { _, _, _ in }
 
         // 10 mp3 in Music + 5 mp3 in Album1 = 15
         XCTAssertEqual(files.count, 15)
@@ -71,7 +71,7 @@ final class ScannerTests: XCTestCase {
             rootPath: testDirectory.path,
             volumeUUID: "TEST-UUID"
         )
-        let files = try await coordinator.scan { _, _ in }
+        let files = try await coordinator.scan { _, _, _ in }
 
         for file in files {
             XCTAssertTrue(BulkScanner.audioExtensions.contains(file.ext),

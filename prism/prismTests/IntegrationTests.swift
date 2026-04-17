@@ -73,7 +73,7 @@ final class IntegrationTests: XCTestCase {
             maxConcurrency: 8
         )
 
-        let totalFiles = try await coordinator.scanStreaming(into: duckDBStore) { count, _ in }
+        let totalFiles = try await coordinator.scanStreaming(into: duckDBStore) { _, _, _ in }
 
         XCTAssertEqual(totalFiles, 1500, "Should find 1500 audio files")
 
@@ -114,7 +114,7 @@ final class IntegrationTests: XCTestCase {
             volumeUUID: volumeUUID,
             maxConcurrency: 8
         )
-        _ = try await coord1.scanStreaming(into: duckDBStore) { _, _ in }
+        _ = try await coord1.scanStreaming(into: duckDBStore) { _, _, _ in }
         let diff1 = try duckDBStore.mergeAndDiff(volumeUUID: volumeUUID)
         try dbManager.syncSearchIndex(from: duckDBStore, volumeUUID: volumeUUID, diff: diff1)
         XCTAssertEqual(diff1.added.count, 1500)
@@ -131,7 +131,7 @@ final class IntegrationTests: XCTestCase {
             volumeUUID: volumeUUID,
             maxConcurrency: 8
         )
-        _ = try await coord2.scanStreaming(into: duckDBStore) { _, _ in }
+        _ = try await coord2.scanStreaming(into: duckDBStore) { _, _, _ in }
 
         let mergeStart = CFAbsoluteTimeGetCurrent()
         let diff2 = try duckDBStore.mergeAndDiff(volumeUUID: volumeUUID)
@@ -162,7 +162,7 @@ final class IntegrationTests: XCTestCase {
             volumeUUID: volumeUUID,
             maxConcurrency: 8
         )
-        let totalFiles = try await coordinator.scanStreaming(into: duckDBStore) { _, _ in }
+        let totalFiles = try await coordinator.scanStreaming(into: duckDBStore) { _, _, _ in }
         let scanTime = CFAbsoluteTimeGetCurrent() - scanStart
 
         let syncStart = CFAbsoluteTimeGetCurrent()
