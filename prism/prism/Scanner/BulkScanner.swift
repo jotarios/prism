@@ -28,10 +28,24 @@ final class BulkScanner {
         "mp2", "mpc", "wv", "tta", "ac3", "dts"
     ]
 
-    private static let skippedDirectories: Set<String> = [
+    /// Directories whose contents are (almost) never audio. Basename-matched.
+    /// Dev-artifact names kept broad but conservative — nothing a user might
+    /// plausibly store music under. A future Phase 5 settings pane can make
+    /// this configurable per-volume.
+    ///
+    /// Note: any directory whose basename starts with `.` or `$` is already
+    /// skipped by the per-entry filter below, so `.git`, `.cache`, `.npm`,
+    /// `$RECYCLE.BIN` etc. don't need entries here.
+    static let skippedDirectories: Set<String> = [
+        // Windows / Samba volume metadata
         "$RECYCLE.BIN", "System Volume Information",
-        "_Serato_", ".Trashes", ".Spotlight-V100",
-        ".fseventsd", ".TemporaryItems"
+        // macOS volume metadata
+        ".Trashes", ".Spotlight-V100", ".fseventsd", ".TemporaryItems",
+        // DJ tool metadata
+        "_Serato_",
+        // Developer artifacts — large, nested, no audio
+        "node_modules", "Pods", "DerivedData", "build",
+        "target", "vendor", "venv", ".venv", "__pycache__"
     ]
 
     private static let initialBufferSize = 256 * 1024

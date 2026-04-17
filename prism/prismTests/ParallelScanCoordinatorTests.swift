@@ -41,7 +41,7 @@ final class ParallelScanCoordinatorTests: XCTestCase {
         // depth=3, dirsPerLevel=3: root + 3 + 9 = 13 dirs, 13 * 5 = 65
 
         let coordinator = ParallelScanCoordinator(rootPath: testDirectory.path, volumeUUID: "TEST")
-        let files = try await coordinator.scan { _, _ in }
+        let files = try await coordinator.scan { _, _, _ in }
 
         XCTAssertEqual(files.count, 65)
     }
@@ -50,7 +50,7 @@ final class ParallelScanCoordinatorTests: XCTestCase {
         try createTree(depth: 3, dirsPerLevel: 4, filesPerDir: 10)
 
         let coordinator = ParallelScanCoordinator(rootPath: testDirectory.path, volumeUUID: "TEST", maxConcurrency: 8)
-        let parallelFiles = try await coordinator.scan { _, _ in }
+        let parallelFiles = try await coordinator.scan { _, _, _ in }
 
         var serialCount = 0
         var queue = [testDirectory.path]
@@ -68,7 +68,7 @@ final class ParallelScanCoordinatorTests: XCTestCase {
         try createTree(depth: 3, dirsPerLevel: 3, filesPerDir: 5)
 
         let coordinator = ParallelScanCoordinator(rootPath: testDirectory.path, volumeUUID: "TEST")
-        let files = try await coordinator.scan { _, _ in }
+        let files = try await coordinator.scan { _, _, _ in }
 
         let paths = files.map { $0.parentPath + "/" + $0.filename }
         let uniquePaths = Set(paths)
@@ -77,7 +77,7 @@ final class ParallelScanCoordinatorTests: XCTestCase {
 
     func testEmptyDirectory() async throws {
         let coordinator = ParallelScanCoordinator(rootPath: testDirectory.path, volumeUUID: "TEST")
-        let files = try await coordinator.scan { _, _ in }
+        let files = try await coordinator.scan { _, _, _ in }
         XCTAssertEqual(files.count, 0)
     }
 
@@ -90,7 +90,7 @@ final class ParallelScanCoordinatorTests: XCTestCase {
         }
 
         let coordinator = ParallelScanCoordinator(rootPath: testDirectory.path, volumeUUID: "TEST")
-        let files = try await coordinator.scan { _, _ in }
+        let files = try await coordinator.scan { _, _, _ in }
         XCTAssertEqual(files.count, 100)
     }
 
@@ -99,7 +99,7 @@ final class ParallelScanCoordinatorTests: XCTestCase {
 
         var progressCalls = 0
         let coordinator = ParallelScanCoordinator(rootPath: testDirectory.path, volumeUUID: "TEST")
-        _ = try await coordinator.scan { count, _ in
+        _ = try await coordinator.scan { _, _, _ in
             progressCalls += 1
         }
 

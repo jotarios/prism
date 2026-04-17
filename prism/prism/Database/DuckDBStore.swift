@@ -25,9 +25,9 @@ final class DuckDBStore: @unchecked Sendable {
     private var cache: [Int64: SearchResult] = [:]
     private var cacheLoaded = false
 
-    // Scan state. `beginScan` sets these; `mergeAndDiff` clears them.
+    // Scan slot. `beginScan` sets this to the active volume; `mergeAndDiff`
+    // clears it. A non-nil value blocks concurrent scans.
     private var currentScanVolume: String?
-    private var currentGeneration: Int64?
 
     private func sync<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
@@ -61,8 +61,7 @@ final class DuckDBStore: @unchecked Sendable {
                 size_bytes BIGINT NOT NULL,
                 date_modified BIGINT NOT NULL,
                 date_created BIGINT NOT NULL,
-                is_online BOOLEAN NOT NULL DEFAULT TRUE,
-                scan_generation BIGINT NOT NULL DEFAULT 0
+                is_online BOOLEAN NOT NULL DEFAULT TRUE
             )
         """)
         try connection.execute("CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_uuid)")
@@ -107,23 +106,14 @@ final class DuckDBStore: @unchecked Sendable {
 
     // MARK: - Scan Lifecycle
 
-    /// Begin a scan of `volumeUUID`. Acquires the scan slot, computes a fresh
-    /// monotonic `scan_generation`, and (re)creates an empty per-volume
-    /// staging table. Returns the generation for logging.
-    func beginScan(volumeUUID: String) throws -> Int64 {
+    /// Begin a scan of `volumeUUID`. Acquires the scan slot and (re)creates
+    /// an empty per-volume staging table. Concurrent scans throw
+    /// `scanAlreadyInProgress`.
+    func beginScan(volumeUUID: String) throws {
         try sync {
             if let existing = currentScanVolume {
                 throw IndexError.scanAlreadyInProgress(volumeUUID: existing)
             }
-
-            // Generation: strictly greater than any prior value for this
-            // volume, so the merge's "rows stamped with current gen" filter
-            // is correct even after app restarts.
-            let genQuery = try connection.query("""
-                SELECT COALESCE(MAX(scan_generation), 0) + 1
-                FROM files WHERE volume_uuid = '\(volumeUUID.replacingOccurrences(of: "'", with: "''"))'
-            """)
-            let gen = genQuery[0].cast(to: Int64.self)[0] ?? 1
 
             let staging = DuckDBStore.stagingTableName(for: volumeUUID)
             try connection.execute("DROP TABLE IF EXISTS \"\(staging)\"")
@@ -136,15 +126,12 @@ final class DuckDBStore: @unchecked Sendable {
                     extension VARCHAR NOT NULL,
                     size_bytes BIGINT NOT NULL,
                     date_modified BIGINT NOT NULL,
-                    date_created BIGINT NOT NULL,
-                    scan_generation BIGINT NOT NULL
+                    date_created BIGINT NOT NULL
                 )
             """)
 
             currentScanVolume = volumeUUID
-            currentGeneration = gen
-            Log.debug("beginScan volume=\(volumeUUID) generation=\(gen)")
-            return gen
+            Log.debug("beginScan volume=\(volumeUUID)")
         }
     }
 
@@ -159,15 +146,15 @@ final class DuckDBStore: @unchecked Sendable {
     /// constraint (use beginScan/mergeAndDiff for idempotent rescans).
     func ingestBatch(_ files: [ScannedFile], volumeUUID: String) throws {
         try sync {
-            if let scanning = currentScanVolume, let gen = currentGeneration, scanning == volumeUUID {
-                try ingestToStagingLocked(files: files, volumeUUID: volumeUUID, generation: gen)
+            if let scanning = currentScanVolume, scanning == volumeUUID {
+                try ingestToStagingLocked(files: files, volumeUUID: volumeUUID)
             } else {
                 try ingestDirectLocked(files: files, volumeUUID: volumeUUID)
             }
         }
     }
 
-    private func ingestToStagingLocked(files: [ScannedFile], volumeUUID: String, generation: Int64) throws {
+    private func ingestToStagingLocked(files: [ScannedFile], volumeUUID: String) throws {
         let staging = DuckDBStore.stagingTableName(for: volumeUUID)
         let appender = try Appender(connection: connection, table: staging)
 
@@ -182,17 +169,16 @@ final class DuckDBStore: @unchecked Sendable {
             try appender.append(Int64(file.sizeBytes))
             try appender.append(Int64(file.modTimeSec))
             try appender.append(Int64(file.createTimeSec))
-            try appender.append(generation)
             try appender.endRow()
         }
 
         try appender.flush()
     }
 
-    /// Direct Appender into `files`. Fast path for non-scan callers. Caller
-    /// is responsible for not re-inserting the same (volume_uuid, path) —
-    /// would trip the UNIQUE index. The scan-time path uses staging + merge
-    /// to handle rescans safely.
+    /// Direct Appender into `files`. Fast path for non-scan callers (tests,
+    /// one-shots). Caller is responsible for not re-inserting the same
+    /// (volume_uuid, path) — would trip the PK via hash equality. The
+    /// scan-time path uses staging + merge to handle rescans safely.
     private func ingestDirectLocked(files: [ScannedFile], volumeUUID: String) throws {
         let appender = try Appender(connection: connection, table: "files")
         for file in files {
@@ -207,7 +193,6 @@ final class DuckDBStore: @unchecked Sendable {
             try appender.append(Int64(file.modTimeSec))
             try appender.append(Int64(file.createTimeSec))
             try appender.append(true)       // is_online
-            try appender.append(Int64(0))   // scan_generation
             try appender.endRow()
         }
         try appender.flush()
@@ -226,8 +211,7 @@ final class DuckDBStore: @unchecked Sendable {
     ///   removed  = files rows (for this volume) whose (path) isn't in staging
     func mergeAndDiff(volumeUUID: String) throws -> ScanDiff {
         try sync {
-            guard let scanning = currentScanVolume, scanning == volumeUUID,
-                  let gen = currentGeneration else {
+            guard let scanning = currentScanVolume, scanning == volumeUUID else {
                 throw IndexError.noActiveScan
             }
 
@@ -277,9 +261,9 @@ final class DuckDBStore: @unchecked Sendable {
                 if !added.isEmpty {
                     try connection.execute("""
                         INSERT INTO files (id, filename, path, volume_uuid, extension,
-                                           size_bytes, date_modified, date_created, is_online, scan_generation)
+                                           size_bytes, date_modified, date_created, is_online)
                         SELECT s.id, s.filename, s.path, s.volume_uuid, s.extension,
-                               s.size_bytes, s.date_modified, s.date_created, TRUE, s.scan_generation
+                               s.size_bytes, s.date_modified, s.date_created, TRUE
                         FROM "\(staging)" s
                         LEFT JOIN files f ON f.id = s.id
                         WHERE f.id IS NULL
@@ -294,8 +278,7 @@ final class DuckDBStore: @unchecked Sendable {
                             extension = s.extension,
                             size_bytes = s.size_bytes,
                             date_modified = s.date_modified,
-                            date_created = s.date_created,
-                            scan_generation = s.scan_generation
+                            date_created = s.date_created
                         FROM "\(staging)" s
                         WHERE files.id = s.id
                           AND (files.size_bytes <> s.size_bytes OR files.date_modified <> s.date_modified)
@@ -318,15 +301,13 @@ final class DuckDBStore: @unchecked Sendable {
                 try? connection.execute("ROLLBACK")
                 // Leave staging table for the next beginScan to clean up.
                 currentScanVolume = nil
-                currentGeneration = nil
                 throw error
             }
 
             currentScanVolume = nil
-            currentGeneration = nil
 
             let diff = ScanDiff(added: added, modified: modified, removedIds: removedIds)
-            Log.debug("mergeAndDiff volume=\(volumeUUID) gen=\(gen) added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
+            Log.debug("mergeAndDiff volume=\(volumeUUID) added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
             return diff
         }
     }

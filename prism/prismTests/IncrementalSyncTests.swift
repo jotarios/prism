@@ -50,21 +50,6 @@ final class IncrementalSyncTests: XCTestCase {
         return try store.mergeAndDiff(volumeUUID: volume)
     }
 
-    // MARK: - Generation monotonicity
-
-    func testBeginScanReturnsMonotonicGeneration() throws {
-        // First scan: ingest something so the row carries a scan_generation
-        // value that MAX() can read on the second beginScan.
-        let g1 = try store.beginScan(volumeUUID: volA)
-        try store.ingestBatch([file("a.mp3")], volumeUUID: volA)
-        _ = try store.mergeAndDiff(volumeUUID: volA)
-        XCTAssertEqual(g1, 1)
-
-        let g2 = try store.beginScan(volumeUUID: volA)
-        _ = try store.mergeAndDiff(volumeUUID: volA)
-        XCTAssertGreaterThan(g2, g1)
-    }
-
     // MARK: - Staging isolation
 
     func testStagingWritesDoNotTouchFilesUntilMerge() throws {

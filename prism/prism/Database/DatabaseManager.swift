@@ -228,6 +228,7 @@ final class DatabaseManager {
 
             // INSERT OR REPLACE for added ∪ modified. The files_ai and
             // files_au triggers handle FTS5 propagation row-by-row.
+            let mutationCount = diff.added.count + diff.modified.count + diff.removedIds.count
             if !diff.added.isEmpty || !diff.modified.isEmpty {
                 let stmt = try db.cachedStatement(
                     sql: "INSERT OR REPLACE INTO files (id, filename, extension) VALUES (?, ?, ?)"
@@ -238,6 +239,16 @@ final class DatabaseManager {
                 for entry in diff.modified {
                     try stmt.execute(arguments: [entry.id, entry.filename, entry.ext])
                 }
+            }
+
+            // After bulk mutations, FTS5 is left with many small segments
+            // that drag down MATCH + ORDER BY rank for common prefixes.
+            // `rebuild` reconstructs the whole index from `files` in a
+            // single optimally-packed segment — same structure main's
+            // bulk-rebuild sync path produces. Only worth the cost when we
+            // just mutated a lot of rows.
+            if mutationCount >= 1000 {
+                try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
             }
         }
 
