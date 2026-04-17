@@ -47,7 +47,7 @@ final class SyncTests: XCTestCase {
     func testSyncHappyPath() async throws {
         try ingestFiles(count: 500)
 
-        try dbManager.syncSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
 
         let sqliteCount = try await dbManager.getFileCount()
         let duckDBCount = try duckDBStore.getFileCount()
@@ -65,7 +65,7 @@ final class SyncTests: XCTestCase {
                        sizeBytes: 4096, modTimeSec: 1700000002, createTimeSec: 1700000000, isDirectory: false),
         ]
         try duckDBStore.ingestBatch(files, volumeUUID: "TEST")
-        try dbManager.syncSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
 
         let ids = try await dbManager.searchFileIDs(query: "dua", limit: 100)
         XCTAssertEqual(ids.count, 2, "Should find 2 'dua' files, found \(ids.count)")
@@ -77,8 +77,8 @@ final class SyncTests: XCTestCase {
     func testResyncIsIdempotent() async throws {
         try ingestFiles(count: 100)
 
-        try dbManager.syncSearchIndex(from: duckDBStore)
-        try dbManager.syncSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
 
         let count = try await dbManager.getFileCount()
         XCTAssertEqual(count, 100)
@@ -86,7 +86,7 @@ final class SyncTests: XCTestCase {
 
     func testTriggersRestoredAfterSync() async throws {
         try ingestFiles(count: 10)
-        try dbManager.syncSearchIndex(from: duckDBStore)
+        try dbManager.rebuildSearchIndex(from: duckDBStore)
 
         let triggerCount = try await Task.detached {
             try self.dbManager.getPragmaSettings()

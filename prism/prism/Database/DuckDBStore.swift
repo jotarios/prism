@@ -6,6 +6,12 @@
 import Foundation
 import DuckDB
 
+enum IndexError: Error {
+    case scanAlreadyInProgress(volumeUUID: String)
+    case noActiveScan
+    case hashCollision(path: String, volumeUUID: String)
+}
+
 // Thread-safe wrapper around a single DuckDB.Connection. All access to the
 // connection and to the in-memory cache is serialized via `lock`, because
 // DuckDB's Swift Connection is not safe for concurrent use from multiple
@@ -18,7 +24,10 @@ final class DuckDBStore: @unchecked Sendable {
     private let lock = NSLock()
     private var cache: [Int64: SearchResult] = [:]
     private var cacheLoaded = false
-    private var nextID: Int64 = 1
+
+    // Scan state. `beginScan` sets these; `mergeAndDiff` clears them.
+    private var currentScanVolume: String?
+    private var currentGeneration: Int64?
 
     private func sync<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
@@ -37,6 +46,7 @@ final class DuckDBStore: @unchecked Sendable {
         database = try Database(store: .file(at: URL(fileURLWithPath: resolvedPath)))
         connection = try database.connect()
         try createSchema()
+        try cleanupOrphanedStaging()
     }
 
     private func createSchema() throws {
@@ -51,44 +61,297 @@ final class DuckDBStore: @unchecked Sendable {
                 size_bytes BIGINT NOT NULL,
                 date_modified BIGINT NOT NULL,
                 date_created BIGINT NOT NULL,
-                is_online BOOLEAN NOT NULL DEFAULT TRUE
+                is_online BOOLEAN NOT NULL DEFAULT TRUE,
+                scan_generation BIGINT NOT NULL DEFAULT 0
             )
         """)
         try connection.execute("CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_uuid)")
+        // Uniqueness of (volume_uuid, path) is enforced indirectly via the
+        // `id` PRIMARY KEY, since id = PathHash.id(volume_uuid, path). A
+        // dedicated UNIQUE index on (volume_uuid, path) costs per-row index
+        // maintenance on every INSERT and isn't needed for correctness —
+        // merge joins use id, not (volume, path).
+        }
+    }
 
-        let result = try connection.query("SELECT COALESCE(MAX(id), 0) FROM files")
-        let maxID = result[0].cast(to: Int64.self)[0] ?? 0
-        nextID = maxID + 1
+    /// Drop any staging tables left behind by a crashed scan. Called once at
+    /// init. Staging tables follow the pattern `files_staging_<sanitized_uuid>`.
+    /// Internal rather than private so tests can drive it without juggling
+    /// DuckDB's process-level file lock.
+    internal func cleanupOrphanedStaging() throws {
+        try sync {
+            let result = try connection.query("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_name LIKE 'files_staging_%'
+            """)
+            let col = result[0].cast(to: String.self)
+            for idx in 0..<result.rowCount {
+                guard let name = col[idx] else { continue }
+                // Table name came from information_schema; safe to interpolate
+                // back after quoting. Still double-quote to be defensive.
+                try connection.execute("DROP TABLE IF EXISTS \"\(name)\"")
+                Log.debug("Dropped orphaned staging table: \(name)")
+            }
+        }
+    }
+
+    /// Replace UUID characters that are awkward in identifiers. Output is
+    /// always safe to quote as a DuckDB identifier.
+    private static func sanitizeVolumeForTable(_ uuid: String) -> String {
+        uuid.replacingOccurrences(of: "-", with: "_")
+    }
+
+    private static func stagingTableName(for volumeUUID: String) -> String {
+        "files_staging_\(sanitizeVolumeForTable(volumeUUID))"
+    }
+
+    // MARK: - Scan Lifecycle
+
+    /// Begin a scan of `volumeUUID`. Acquires the scan slot, computes a fresh
+    /// monotonic `scan_generation`, and (re)creates an empty per-volume
+    /// staging table. Returns the generation for logging.
+    func beginScan(volumeUUID: String) throws -> Int64 {
+        try sync {
+            if let existing = currentScanVolume {
+                throw IndexError.scanAlreadyInProgress(volumeUUID: existing)
+            }
+
+            // Generation: strictly greater than any prior value for this
+            // volume, so the merge's "rows stamped with current gen" filter
+            // is correct even after app restarts.
+            let genQuery = try connection.query("""
+                SELECT COALESCE(MAX(scan_generation), 0) + 1
+                FROM files WHERE volume_uuid = '\(volumeUUID.replacingOccurrences(of: "'", with: "''"))'
+            """)
+            let gen = genQuery[0].cast(to: Int64.self)[0] ?? 1
+
+            let staging = DuckDBStore.stagingTableName(for: volumeUUID)
+            try connection.execute("DROP TABLE IF EXISTS \"\(staging)\"")
+            try connection.execute("""
+                CREATE TABLE "\(staging)" (
+                    id BIGINT NOT NULL,
+                    filename VARCHAR NOT NULL,
+                    path VARCHAR NOT NULL,
+                    volume_uuid VARCHAR NOT NULL,
+                    extension VARCHAR NOT NULL,
+                    size_bytes BIGINT NOT NULL,
+                    date_modified BIGINT NOT NULL,
+                    date_created BIGINT NOT NULL,
+                    scan_generation BIGINT NOT NULL
+                )
+            """)
+
+            currentScanVolume = volumeUUID
+            currentGeneration = gen
+            Log.debug("beginScan volume=\(volumeUUID) generation=\(gen)")
+            return gen
         }
     }
 
     // MARK: - Ingestion
 
+    /// Ingest a batch of scanned files. When a scan is active (beginScan was
+    /// called and mergeAndDiff hasn't yet run), rows land in the per-volume
+    /// staging table. Otherwise — tests, one-shots — this routes through a
+    /// direct Appender into `files` with hash-derived ids. That path is fast
+    /// on an empty or newly-deleted-for-volume table; if the caller ingests
+    /// the same (volume, path) twice, the second call violates the UNIQUE
+    /// constraint (use beginScan/mergeAndDiff for idempotent rescans).
     func ingestBatch(_ files: [ScannedFile], volumeUUID: String) throws {
         try sync {
-        let appender = try Appender(connection: connection, table: "files")
+            if let scanning = currentScanVolume, let gen = currentGeneration, scanning == volumeUUID {
+                try ingestToStagingLocked(files: files, volumeUUID: volumeUUID, generation: gen)
+            } else {
+                try ingestDirectLocked(files: files, volumeUUID: volumeUUID)
+            }
+        }
+    }
+
+    private func ingestToStagingLocked(files: [ScannedFile], volumeUUID: String, generation: Int64) throws {
+        let staging = DuckDBStore.stagingTableName(for: volumeUUID)
+        let appender = try Appender(connection: connection, table: staging)
 
         for file in files {
-            do {
-                try appender.append(nextID)
-                nextID += 1
-                try appender.append(file.filename)
-                try appender.append(file.parentPath + "/" + file.filename)
-                try appender.append(volumeUUID)
-                try appender.append(file.ext)
-                try appender.append(Int64(file.sizeBytes))
-                try appender.append(Int64(file.modTimeSec))
-                try appender.append(Int64(file.createTimeSec))
-                try appender.append(true)
-                try appender.endRow()
-            } catch {
-                Log.error("DuckDB ingest error for \(file.filename): \(error)")
-                throw error
-            }
+            let path = file.parentPath + "/" + file.filename
+            let id = PathHash.id(volumeUUID: volumeUUID, path: path)
+            try appender.append(id)
+            try appender.append(file.filename)
+            try appender.append(path)
+            try appender.append(volumeUUID)
+            try appender.append(file.ext)
+            try appender.append(Int64(file.sizeBytes))
+            try appender.append(Int64(file.modTimeSec))
+            try appender.append(Int64(file.createTimeSec))
+            try appender.append(generation)
+            try appender.endRow()
         }
 
         try appender.flush()
+    }
+
+    /// Direct Appender into `files`. Fast path for non-scan callers. Caller
+    /// is responsible for not re-inserting the same (volume_uuid, path) —
+    /// would trip the UNIQUE index. The scan-time path uses staging + merge
+    /// to handle rescans safely.
+    private func ingestDirectLocked(files: [ScannedFile], volumeUUID: String) throws {
+        let appender = try Appender(connection: connection, table: "files")
+        for file in files {
+            let path = file.parentPath + "/" + file.filename
+            let id = PathHash.id(volumeUUID: volumeUUID, path: path)
+            try appender.append(id)
+            try appender.append(file.filename)
+            try appender.append(path)
+            try appender.append(volumeUUID)
+            try appender.append(file.ext)
+            try appender.append(Int64(file.sizeBytes))
+            try appender.append(Int64(file.modTimeSec))
+            try appender.append(Int64(file.createTimeSec))
+            try appender.append(true)       // is_online
+            try appender.append(Int64(0))   // scan_generation
+            try appender.endRow()
         }
+        try appender.flush()
+    }
+
+    // MARK: - Merge
+
+    /// Compute the scan's diff against `files`, apply it to DuckDB, drop the
+    /// staging table, release the scan slot, and return the diff so the
+    /// SQLite sync step can propagate the same set of changes.
+    ///
+    /// SQL shape (three logical queries, one transaction):
+    ///   added    = staging rows whose (volume, path) isn't in files
+    ///   modified = staging rows whose (volume, path) is in files but
+    ///              (size_bytes, date_modified) differ
+    ///   removed  = files rows (for this volume) whose (path) isn't in staging
+    func mergeAndDiff(volumeUUID: String) throws -> ScanDiff {
+        try sync {
+            guard let scanning = currentScanVolume, scanning == volumeUUID,
+                  let gen = currentGeneration else {
+                throw IndexError.noActiveScan
+            }
+
+            let staging = DuckDBStore.stagingTableName(for: volumeUUID)
+
+            var added: [ScanDiff.Entry] = []
+            var modified: [ScanDiff.Entry] = []
+            var removedIds: [Int64] = []
+
+            try connection.execute("BEGIN TRANSACTION")
+            do {
+                let quotedVolume = "'\(volumeUUID.replacingOccurrences(of: "'", with: "''"))'"
+
+                // Joins use `id` (= PathHash.id(volume, path)) rather than
+                // (volume_uuid, path). The PK gives us a hash lookup instead
+                // of a two-column scan, and the semantics are identical by
+                // construction: same id ⇔ same (volume, path).
+
+                // --- ADDED: staging rows whose id isn't in files.
+                let addedResult = try connection.query("""
+                    SELECT s.id, s.filename, s.extension
+                    FROM "\(staging)" s
+                    LEFT JOIN files f ON f.id = s.id
+                    WHERE f.id IS NULL
+                """)
+                added = extractEntries(from: addedResult)
+
+                // --- MODIFIED: matching id, differing (size, mtime).
+                let modifiedResult = try connection.query("""
+                    SELECT s.id, s.filename, s.extension
+                    FROM "\(staging)" s
+                    JOIN files f ON f.id = s.id
+                    WHERE f.size_bytes <> s.size_bytes OR f.date_modified <> s.date_modified
+                """)
+                modified = extractEntries(from: modifiedResult)
+
+                // --- REMOVED: files rows on this volume whose id isn't in staging.
+                let removedResult = try connection.query("""
+                    SELECT f.id FROM files f
+                    LEFT JOIN "\(staging)" s ON s.id = f.id
+                    WHERE f.volume_uuid = \(quotedVolume)
+                      AND s.id IS NULL
+                """)
+                removedIds = extractIds(from: removedResult)
+
+                // --- Apply to DuckDB. Order matters: INSERT before DELETE.
+                if !added.isEmpty {
+                    try connection.execute("""
+                        INSERT INTO files (id, filename, path, volume_uuid, extension,
+                                           size_bytes, date_modified, date_created, is_online, scan_generation)
+                        SELECT s.id, s.filename, s.path, s.volume_uuid, s.extension,
+                               s.size_bytes, s.date_modified, s.date_created, TRUE, s.scan_generation
+                        FROM "\(staging)" s
+                        LEFT JOIN files f ON f.id = s.id
+                        WHERE f.id IS NULL
+                    """)
+                }
+                if !modified.isEmpty {
+                    // UPDATE excludes `is_online` so a Phase-5 offline flag
+                    // isn't clobbered by rescans.
+                    try connection.execute("""
+                        UPDATE files
+                        SET filename = s.filename,
+                            extension = s.extension,
+                            size_bytes = s.size_bytes,
+                            date_modified = s.date_modified,
+                            date_created = s.date_created,
+                            scan_generation = s.scan_generation
+                        FROM "\(staging)" s
+                        WHERE files.id = s.id
+                          AND (files.size_bytes <> s.size_bytes OR files.date_modified <> s.date_modified)
+                    """)
+                }
+                if !removedIds.isEmpty {
+                    // DuckDB has no parameter-count limit like SQLite's 32K,
+                    // but we chunk for readability and DELETE query size.
+                    for chunk in removedIds.chunked(into: 1000) {
+                        let list = chunk.map(String.init).joined(separator: ",")
+                        try connection.execute("""
+                            DELETE FROM files WHERE id IN (\(list))
+                        """)
+                    }
+                }
+
+                try connection.execute("DROP TABLE IF EXISTS \"\(staging)\"")
+                try connection.execute("COMMIT")
+            } catch {
+                try? connection.execute("ROLLBACK")
+                // Leave staging table for the next beginScan to clean up.
+                currentScanVolume = nil
+                currentGeneration = nil
+                throw error
+            }
+
+            currentScanVolume = nil
+            currentGeneration = nil
+
+            let diff = ScanDiff(added: added, modified: modified, removedIds: removedIds)
+            Log.debug("mergeAndDiff volume=\(volumeUUID) gen=\(gen) added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
+            return diff
+        }
+    }
+
+    private func extractEntries(from result: ResultSet) -> [ScanDiff.Entry] {
+        let idCol = result[0].cast(to: Int64.self)
+        let nameCol = result[1].cast(to: String.self)
+        let extCol = result[2].cast(to: String.self)
+        var out: [ScanDiff.Entry] = []
+        out.reserveCapacity(Int(result.rowCount))
+        for i in 0..<result.rowCount {
+            guard let id = idCol[i], let name = nameCol[i], let ext = extCol[i] else { continue }
+            out.append(ScanDiff.Entry(id: id, filename: name, ext: ext))
+        }
+        return out
+    }
+
+    private func extractIds(from result: ResultSet) -> [Int64] {
+        let idCol = result[0].cast(to: Int64.self)
+        var out: [Int64] = []
+        out.reserveCapacity(Int(result.rowCount))
+        for i in 0..<result.rowCount {
+            if let id = idCol[i] { out.append(id) }
+        }
+        return out
     }
 
     // MARK: - Queries
@@ -133,6 +396,39 @@ final class DuckDBStore: @unchecked Sendable {
         sync {
             cache.removeAll()
             cacheLoaded = false
+        }
+    }
+
+    /// Apply an already-computed scan diff to the in-memory cache. Called
+    /// after `syncSearchIndex(from:volumeUUID:diff:)` so the cache stays
+    /// consistent without an O(N) `loadCache()` reload.
+    func applyDiff(_ diff: ScanDiff) throws {
+        try sync {
+            // If the cache was never loaded, first-time `loadCache` is still
+            // the cheaper and simpler path. Callers can decide.
+            guard cacheLoaded else { return }
+
+            for id in diff.removedIds {
+                cache.removeValue(forKey: id)
+            }
+
+            let affectedIds = diff.added.map(\.id) + diff.modified.map(\.id)
+            guard !affectedIds.isEmpty else { return }
+
+            // Fetch full row data for added/modified ids so the cache holds
+            // display-ready SearchResult values, not just the sync-minimal
+            // subset carried in ScanDiff.Entry.
+            for chunk in affectedIds.chunked(into: 1000) {
+                let list = chunk.map(String.init).joined(separator: ",")
+                let result = try connection.query("""
+                    SELECT id, filename, path, volume_uuid, extension,
+                           size_bytes, date_modified, date_created, is_online
+                    FROM files WHERE id IN (\(list))
+                """)
+                for r in extractSearchResults(from: result) {
+                    cache[r.id] = r
+                }
+            }
         }
     }
 
@@ -328,4 +624,12 @@ struct SyncRecord: Sendable {
     let id: Int64
     let filename: String
     let ext: String
+}
+
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
 }
