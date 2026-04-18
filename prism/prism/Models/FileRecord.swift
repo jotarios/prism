@@ -34,15 +34,22 @@ struct FileRecordInsert: Sendable {
 }
 
 /// Diff produced by a scan: rows added, rows whose content changed, and rows
-/// that vanished. Lets `DatabaseManager.syncSearchIndex(from:volumeUUID:diff:)`
-/// propagate only the delta to SQLite/FTS5 and the in-memory cache.
+/// that vanished. Carries the full row data needed by both consumers:
+///   - `DatabaseManager.syncSearchIndex(...)` — uses id/filename/ext for FTS5
+///   - `DuckDBStore.applyDiff(...)` — uses the rest to rebuild SearchResult
+///     for the in-memory cache without re-querying DuckDB
+/// Carrying the full payload costs a few extra fields per diff entry but
+/// eliminates an `IN (27K-ids)` round-trip to DuckDB on every rescan.
 struct ScanDiff: Sendable {
-    /// Subset of fields sync needs, carried alongside the id so the sync step
-    /// doesn't re-round-trip DuckDB.
     struct Entry: Sendable {
         let id: Int64
         let filename: String
+        let path: String
+        let volumeUUID: String
         let ext: String
+        let sizeBytes: Int64
+        let dateModified: Int64   // unix seconds — Date materialized at point of use
+        let dateCreated: Int64
     }
 
     let added: [Entry]

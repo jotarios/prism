@@ -168,25 +168,37 @@ class SearchViewModel: ObservableObject {
                 }
 
                 let postStart = CFAbsoluteTimeGetCurrent()
+                let mergeStart = CFAbsoluteTimeGetCurrent()
                 let diff = try store.mergeAndDiff(volumeUUID: volume.uuid)
+                let mergeTime = CFAbsoluteTimeGetCurrent() - mergeStart
                 Log.debug("ScanDiff: added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
 
                 // First scan of a brand-new DuckDB produces a diff where
                 // every row is in `added` and the cache is empty. loadCache
                 // is still the cheapest path in that case.
+                var syncTime: Double = 0
+                var applyDiffTime: Double = 0
                 if !diff.isEmpty {
+                    let syncStart = CFAbsoluteTimeGetCurrent()
                     try self.dbManager.syncSearchIndex(from: store, volumeUUID: volume.uuid, diff: diff)
+                    syncTime = CFAbsoluteTimeGetCurrent() - syncStart
+
+                    let applyDiffStart = CFAbsoluteTimeGetCurrent()
                     try store.applyDiff(diff)
+                    applyDiffTime = CFAbsoluteTimeGetCurrent() - applyDiffStart
                 }
 
                 // If the cache was never loaded (cold start, first scan),
                 // applyDiff is a no-op. Do a one-time full load.
+                var loadCacheTime: Double = 0
                 if store.getAllCachedValues().isEmpty && (try? store.getFileCount()) ?? 0 > 0 {
+                    let loadStart = CFAbsoluteTimeGetCurrent()
                     try store.loadCache()
+                    loadCacheTime = CFAbsoluteTimeGetCurrent() - loadStart
                 }
 
                 let postTime = CFAbsoluteTimeGetCurrent() - postStart
-                Log.debug("FTS5 sync + cache (incremental): \(String(format: "%.2f", postTime))s")
+                Log.debug("Post-scan breakdown: merge=\(String(format: "%.2f", mergeTime))s sync=\(String(format: "%.2f", syncTime))s applyDiff=\(String(format: "%.2f", applyDiffTime))s loadCache=\(String(format: "%.2f", loadCacheTime))s total=\(String(format: "%.2f", postTime))s")
 
                 let totalTime = CFAbsoluteTimeGetCurrent() - pipelineStart
                 Log.debug("Total pipeline: \(String(format: "%.2f", totalTime))s for \(totalFiles) files (\(String(format: "%.0f", Double(totalFiles) / max(totalTime, 0.001))) files/sec)")

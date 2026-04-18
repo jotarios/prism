@@ -20,15 +20,17 @@ Prism is a high-performance desktop search utility for macOS that maintains a ti
 ### Full pipeline (27,604 audio files, 2TB USB ExFAT drive)
 
 | Stage | Time | % of pipeline |
-|-------|------|---------------|
-| USB I/O + scan | 6.00s | 81% |
-| DuckDB Appender writes | 0.80s | 11% |
-| FTS5 sync + cache load (parallel) | 0.57s | 8% |
-| **Total ingestion** | **7.39s** | **4x faster than original (~30s)** |
-| **Search "amor"** (834 results) | **2.7ms** | **37x faster than original (~100ms)** |
+|-------|------:|---------------:|
+| USB I/O + scan | 5.26s | 67% |
+| mergeAndDiff (DuckDB staging → files) | 1.40s | 18% |
+| Incremental SQLite + FTS5 sync | 0.88s | 11% |
+| loadCache (first scan only) | 0.26s | 3% |
+| **Total first-scan ingestion** | **7.80s** | |
+| Search `amor` (834 results, warm cache) | **~8ms** | |
 
-> 81% of pipeline time is USB I/O. The code (DuckDB + FTS5 + cache) completes in 1.37s.
-> On internal SSD, the same 27K files would ingest in ~1.5s.
+> ~70% of first-scan time is USB I/O. The code (DuckDB + FTS5 + cache)
+> completes in ~2.5s of that 7.8s. On internal SSD, the same 27K files would
+> ingest in ~2–3s.
 
 ### Scanner throughput (7,800 files, internal SSD)
 
@@ -38,12 +40,20 @@ Prism is a high-performance desktop search utility for macOS that maintains a ti
 | `getattrlistbulk` serial | 623K files/sec | 5.6x |
 | `getattrlistbulk` parallel (8 workers) | 1,530K files/sec | **14x** |
 
-### Search latency (27,604 files)
+### Search latency (27,604 files, warm cache)
 
-| Query | FTS5 | Cache | Total |
-|-------|------|-------|-------|
-| `am` (1,000 results) | 4.9ms | 0.6ms | 5.6ms |
-| `amor` (834 results) | 2.4ms | 0.3ms | 2.7ms |
+| Query | FTS5 | Cache | Total | Results |
+|-------|------:|------:|------:|------:|
+| `daster` (specific) | 1.5ms | 0.0ms | 1.5ms | 4 |
+| `jorge` | 1.8ms | 0.0ms | 1.8ms | 26 |
+| `amor` | 7–8ms | 0.5ms | 7–8ms | 834 |
+| `am` (broad) | 7ms | 0.6ms | 7.6ms | 1000 (capped) |
+| `a` (broad) | 46ms | 0.6ms | 47ms | 1000 (capped) |
+| `d` (broad) | 96ms | 3.5ms | 100ms | 1000 (capped) |
+
+Narrow queries complete in under 10 ms end-to-end including GCD + MainActor
+hops. Broad prefixes hit the 1 000-result cap where BM25 ranking dominates
+and latency scales with candidate-set size.
 
 ### Optimization breakdown
 
@@ -57,17 +67,41 @@ Prism is a high-performance desktop search utility for macOS that maintains a ti
 | Hash-derived stable IDs | Same Int64 across rescans; no PK churn |
 | Incremental FTS5 sync via existing triggers | O(delta) per rescan |
 | In-memory cache for search results | 0.3ms vs 200ms DuckDB point lookup |
+| Multi-connection DuckDB (1 writer + 3 readers) | Search stays responsive during active scans |
+| `ScanDiff` carries full row payload | `applyDiff` builds `SearchResult` in-memory; no DuckDB refetch. Saves ~6s on Clear→rescan. |
+
+### Search during scan (multi-connection DuckDB)
+
+| scenario | warm cache-hit p99 | overhead vs idle |
+|---|---:|---:|
+| Search, no scan in flight | 1.63 ms | 1.00× |
+| Search, while 50K-row scan ingesting | 1.92 ms | **1.18×** |
+
+Before this change, readers queued behind the writer's `Appender.flush()` and
+could block for seconds during a scan burst. The writer + 3-reader pool
+architecture lets searches proceed on their own MVCC snapshots — the writer
+queue only serializes *writes*, not *reads*. Hot-path cache-hit search stays
+under 2 ms p99 even mid-scan.
 
 ### Incremental rescan (Sync v2)
 
-Rescanning an unchanged volume is now near-instant. Same 27,604-file USB drive:
+Rescanning an unchanged volume is near-instant, and Clear-then-rescan is
+bounded by scan I/O + SQLite sync. Same 27,604-file USB drive:
 
-| Scan | Scan I/O | Merge + sync + cache | Total |
-|---|---|---|---|
-| First scan (all 27K added) | 6.40s | 2.15s | 8.77s |
-| Second scan (unchanged) | 5.87s | **0.31s** | **6.49s** |
+| Scan | Scan I/O | Merge + sync + applyDiff | Total |
+|---|---:|---:|---:|
+| First scan (all 27K added, fresh DB) | 5.26s | 2.54s | 7.80s |
+| Unchanged rescan (empty diff) | 0.99s | **0.42s** | **1.43s** |
+| Clear Index → rescan | 0.75s | **2.73s** | **3.51s** |
 
-Merge time is proportional to `|added ∪ modified ∪ removed|`, not to the volume size. A rescan that adds 10 files and removes 3 completes in milliseconds of DB work regardless of library size.
+The Clear→rescan path used to take 9s+ because `applyDiff` made 28 chunked
+`IN (...)` point lookups against DuckDB to rebuild the cache (~200ms each).
+`ScanDiff.Entry` now carries the full row payload harvested at merge time,
+so `applyDiff` is a pure in-memory dictionary update: **6.00s → 0.01s**.
+
+Merge time is proportional to `|added ∪ modified ∪ removed|`, not to the
+volume size. A rescan that adds 10 files and removes 3 completes in
+milliseconds of DB work regardless of library size.
 
 ## Supported Audio Formats
 

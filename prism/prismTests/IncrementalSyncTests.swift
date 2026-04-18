@@ -194,12 +194,12 @@ final class IncrementalSyncTests: XCTestCase {
 
     func testOrphanedStagingDroppedByCleanup() throws {
         // Simulate a crashed scan by manually creating a staging table.
-        try store.connection_execute("""
+        try store.writer_execute("""
             CREATE TABLE IF NOT EXISTS files_staging_ORPHAN_FAKE (id BIGINT)
         """)
 
         // Confirm it's there.
-        let before = try store.connection_query("""
+        let before = try store.writer_query("""
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema = 'main' AND table_name LIKE 'files_staging_%'
         """)
@@ -208,7 +208,7 @@ final class IncrementalSyncTests: XCTestCase {
         // Run cleanup directly (the same call init makes at startup).
         try store.cleanupOrphanedStaging()
 
-        let after = try store.connection_query("""
+        let after = try store.writer_query("""
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema = 'main' AND table_name LIKE 'files_staging_%'
         """)
@@ -221,7 +221,10 @@ final class IncrementalSyncTests: XCTestCase {
         _ = try runScan(volume: volA, files: [file("a.mp3")])
         // Don't loadCache. applyDiff should be a safe no-op.
         let diff = ScanDiff(
-            added: [.init(id: 1, filename: "x", ext: "mp3")],
+            added: [.init(
+                id: 1, filename: "x", path: "/V/x.mp3", volumeUUID: "V",
+                ext: "mp3", sizeBytes: 0, dateModified: 0, dateCreated: 0
+            )],
             modified: [],
             removedIds: []
         )
