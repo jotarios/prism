@@ -35,14 +35,14 @@ INGESTION:
        │ AsyncStream (producer-consumer)
        ▼
   files_staging_<volume> (per-scan DuckDB table, Appender fast path)
-       │ mergeAndDiff (set-based SQL, id-keyed)
+       │ mergeAndDiff (set-based SQL, id-keyed) — emits ScanDiff with full row payload
        ▼
   DuckDB files (on disk) ── source of truth, all metadata
-       │ incremental sync (only added/modified/removed ids)
+       │ ScanDiff has everything syncSearchIndex + applyDiff need — no refetch
        ▼
   SQLite/FTS5 (on disk) ── search index only (id, filename, extension)
        │
-  In-memory cache ── Dictionary<Int64, SearchResult> for display
+  In-memory cache ── Dictionary<Int64, SearchResult> built from ScanDiff directly
 ```
 
 IDs are deterministic: `id = FNV-1a64(volume_uuid || "\0" || path)` via
@@ -67,6 +67,11 @@ FTS5 rowid with no translation.
 
 3. **DuckDBStore** (`Database/DuckDBStore.swift`)
    - Persistent on-disk metadata store at `~/Library/Application Support/Prism/metadata.duckdb`
+   - **Multi-connection architecture**: 1 writer (`WriterConnection`) + 3-connection
+     reader pool (`ReaderPool`). Writes serialize through the writer's NSLock;
+     reads round-robin across the reader pool. Cache has its own `cacheLock`,
+     separate from DuckDB access. Lets searches complete on MVCC snapshots while
+     a scan's `Appender` is writing.
    - Appender API for fast ingestion into a per-volume staging table
    - `beginScan` / `mergeAndDiff` / `applyDiff` drive the incremental flow
    - Single-scan slot: concurrent scans throw `IndexError.scanAlreadyInProgress`
@@ -74,6 +79,10 @@ FTS5 rowid with no translation.
    - In-memory cache (`Dictionary<Int64, SearchResult>`) updated incrementally
      via `applyDiff` on every rescan
    - Single-process only — DuckDB locks the file, cannot have two instances
+   - `DuckDBStore`, `WriterConnection`, `ReaderPool` are all `nonisolated` — the
+     project sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so any new class
+     holding a DuckDB `Connection` must opt out or its deinit will race with
+     DuckDB cleanup via Swift's `swift_task_deinitOnExecutorImpl` path
 
 4. **DatabaseManager** (`Database/DatabaseManager.swift`)
    - SQLite/GRDB for FTS5 search index at `~/Library/Application Support/Prism/index.db`
@@ -84,10 +93,16 @@ FTS5 rowid with no translation.
        propagates to FTS5 via existing `files_ai`/`files_ad`/`files_au`. If
        the diff is large (≥1000 mutations), a `('rebuild')` pass packs
        segments for query performance.
-     - `rebuildSearchIndex(from:)` — O(N) full rebuild. Used by Clear Index /
-       Rebuild Index in Settings.
+     - `rebuildSearchIndex(from:vacuumAfter:)` — O(N) full rebuild. Used by
+       Clear Index / Rebuild Index in Settings. `vacuumAfter` defaults to
+       false — A/B benchmarks (bench/vacuum-ab.csv) showed only a 10% rescan
+       win at 27K rows, not worth the VACUUM cost on large indexes.
    - FTS5 trigger SQL lives in one `createFTS5Triggers(_:)` helper
    - Startup trigger integrity check for crash recovery
+   - `init(testPath:)` — test-only initializer that bypasses the hardcoded
+     `~/Library/Application Support/Prism/` path. Benchmarks MUST use this;
+     hitting the shared singleton's real path corrupts user data and
+     produces meaningless numbers.
 
 5. **PathHash** (`Database/PathHash.swift`)
    - Stable FNV-1a 64-bit hash of (volume_uuid, path). Deterministic
@@ -120,13 +135,26 @@ BulkScanner × N workers ──► AsyncStream<StreamChunk> ──► DuckDB App
                                      mergeAndDiff (set-based SQL, id-keyed)
                                                               │
                                                               ▼
-                                                  ScanDiff { added, modified, removedIds }
+                            ScanDiff {
+                              added:   [Entry{id, filename, path, volumeUUID,
+                                             ext, sizeBytes, dateModified, dateCreated}],
+                              modified: [Entry{...same shape...}],
+                              removedIds: [Int64]
+                            }
                                                               │
                                                   ┌───────────┴───────────┐
                                                   ▼                       ▼
                                     SQLite DELETE/INSERT OR REPLACE    cache.applyDiff
-                                    (triggers update FTS5)             (Dictionary patch)
+                                    (triggers update FTS5)             (builds SearchResult
+                                                                        from Entry — zero
+                                                                        DuckDB round-trips)
 ```
+
+`ScanDiff.Entry` carries the full row payload so `applyDiff` can construct
+`SearchResult` values directly and never has to re-query DuckDB. Before this
+change, applyDiff did 28 × `SELECT ... WHERE id IN (...)` chunks on the
+writer connection, costing ~6s for a 27K-row rescan (DuckDB point-lookups
+are ~200ms each — see "DuckDB point lookups" below).
 
 Empty-diff rescans skip the sync entirely and patch the cache with zero
 rows — rescanning an unchanged volume does near-zero post-scan work.
@@ -162,17 +190,21 @@ All logging goes through `Log.swift` using `os.Logger`:
 - **DuckDB file locking**: Only one process can open a `.duckdb` file. Kill old app before relaunching.
 - **DuckDB Appender**: Does not support ON CONFLICT. The staging-table merge pattern is how we get upsert semantics without losing Appender throughput. See github.com/duckdb/duckdb#11275 — direct `ON CONFLICT DO UPDATE` degrades to ~100s per 10k rows at 100k-row scale.
 - **IDs are hash-derived and stable**: `PathHash.id(volumeUUID:path:)` — FNV-1a 64-bit. Never switch the hash function without a full re-index (every row's PK would change). Collisions throw `IndexError.hashCollision`.
-- **DuckDB point lookups**: Slow (200ms+ for IN(...) queries). Use in-memory cache instead.
+- **DuckDB point lookups**: Slow (200ms+ for IN(...) queries). Use in-memory cache instead. This is why `ScanDiff.Entry` carries full row data — `applyDiff` must NOT hit DuckDB after mergeAndDiff, even for "correctness refetch." See the Scan Flow diagram.
 - **FTS5 bulk rebuild** (`INSERT INTO files_fts(files_fts) VALUES('rebuild')`) beats per-row triggers for bulk inserts, but fragments FTS5 segments on incremental paths. Incremental sync fires a `'rebuild'` pass only when the diff is ≥1000 mutations.
 - **Staging tables are per-volume**: `files_staging_<sanitized_uuid>`. Sanitization replaces `-` with `_` and the name is double-quoted in SQL. Orphan staging tables (from crashed scans) are dropped at `DuckDBStore.init` via `cleanupOrphanedStaging`.
 - **Scan slot**: `currentScanVolume` in `DuckDBStore` serializes scans. Concurrent `beginScan` throws. Required because the merge SQL assumes exclusive access to the scan's staging table.
 
 ## Performance Targets
 
-- Search latency: <5ms (FTS5 + cache) for narrow queries; longer for broad prefixes capped at 1000 results (BM25 ranking dominates)
-- Scan throughput: 1.5M files/sec (internal SSD), 4K files/sec (USB), I/O-bound
-- First-scan pipeline: ~8s for 27K files on USB (scan 6s + merge 0.1s + incremental sync + 'rebuild' pass ~2s)
-- **Rescan of unchanged volume: ~6.5s total, <0.3s post-scan work** (diff empty → sync skipped)
+Measurements from real USB drive, 27 604 audio files.
+
+- **Search latency**: <10ms warm cache-hit for narrow queries; broad prefixes capped at 1000 results take 50–100ms (BM25 ranking dominates)
+- **Scan throughput**: 1.5M files/sec (internal SSD), 4K files/sec (USB), I/O-bound
+- **First-scan pipeline**: ~7s for 27K files on USB (scan ~5s + merge ~1.4s + incremental sync ~0.9s + loadCache ~0.3s)
+- **Rescan of unchanged volume**: ~1.5s total, ~0.4s post-scan work (empty diff → sync skipped, mergeAndDiff still does its join)
+- **Rescan after Clear Index**: ~3.5s total (scan cache-warm ~0.8s + merge ~1.5s + sync ~1.2s + applyDiff ~0.01s). Before the applyDiff refactor this was 9s+ — see Scan Flow.
+- **Search during an active scan (p99)**: 1.92ms warm cache-hit, 1.18× idle. Enabled by the writer + 3-reader connection pool.
 - UI responsiveness: <16ms (60fps)
 
 ## Development Roadmap

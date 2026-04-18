@@ -26,13 +26,21 @@ final class DatabaseManager {
     static let shared = DatabaseManager()
 
     private var dbPool: DatabasePool!
-    private let dbPath: String
+    let dbPath: String
 
     private init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let prismDir = appSupport.appendingPathComponent("Prism", isDirectory: true)
         try? FileManager.default.createDirectory(at: prismDir, withIntermediateDirectories: true)
         dbPath = prismDir.appendingPathComponent("index.db").path
+    }
+
+    /// Testable initializer — takes an explicit DB path so tests and
+    /// benchmarks can run isolated against temp files instead of clobbering
+    /// the production `~/Library/Application Support/Prism/index.db` that
+    /// the `.shared` singleton owns.
+    init(testPath: String) {
+        self.dbPath = testPath
     }
 
     // MARK: - Database Lifecycle
@@ -164,7 +172,13 @@ final class DatabaseManager {
     /// Full rebuild of the SQLite search index from DuckDB. Used by Clear
     /// Index / Rebuild Index and by first-time sync. Scan-time callers should
     /// prefer `syncSearchIndex(from:volumeUUID:diff:)` which is O(delta).
-    func rebuildSearchIndex(from store: DuckDBStore) throws {
+    /// - Parameter vacuumAfter: If true, runs `VACUUM` after the rebuild
+    ///   commits. Default is false because A/B benchmarks (bench/vacuum-ab.csv)
+    ///   show only a ~10% rescan win at 27K rows — not enough to justify the
+    ///   VACUUM cost, which grows with DB size. The original 8.55s production
+    ///   slowdown that prompted this was not reproduced in a controlled
+    ///   benchmark; the cause is still unidentified.
+    func rebuildSearchIndex(from store: DuckDBStore, vacuumAfter: Bool = false) throws {
         // Snapshot all records from DuckDB first (outside the SQLite transaction
         // so we don't hold a write lock while reading from the other DB).
         var allRecords: [SyncRecord] = []
@@ -189,6 +203,18 @@ final class DatabaseManager {
 
             try DatabaseManager.createFTS5Triggers(db)
             try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+        }
+
+        // Reclaim pages freed by the DELETE above. Without this, a Clear
+        // Index → rescan cycle leaves the index.db file bloated from its
+        // previous contents, and the next scan's per-row INSERT triggers
+        // churn on the free list. VACUUM can't run inside a transaction,
+        // so it goes after the write block. Runs outside `dbPool.write`
+        // because VACUUM takes its own exclusive lock.
+        if vacuumAfter {
+            try dbPool.writeWithoutTransaction { db in
+                try db.execute(sql: "VACUUM")
+            }
         }
 
         let sqliteCount = try dbPool.read { db in

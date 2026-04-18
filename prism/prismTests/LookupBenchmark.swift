@@ -58,7 +58,7 @@ final class LookupBenchmark: XCTestCase {
         // --- Strategy 1: Single IN(...) with all IDs (current) ---
         let t1 = try measure(iterations: 5) {
             let placeholders = sampleIDs.map { String($0) }.joined(separator: ",")
-            let _ = try self.store.connection_query("""
+            let _ = try self.store.writer_query("""
                 SELECT id, filename, path, volume_uuid, extension,
                        size_bytes, date_modified, date_created, is_online
                 FROM files WHERE id IN (\(placeholders))
@@ -72,7 +72,7 @@ final class LookupBenchmark: XCTestCase {
             for batch in stride(from: 0, to: sampleIDs.count, by: 100) {
                 let batchIDs = Array(sampleIDs[batch..<min(batch+100, sampleIDs.count)])
                 let placeholders = batchIDs.map { String($0) }.joined(separator: ",")
-                let r = try self.store.connection_query("""
+                let r = try self.store.writer_query("""
                     SELECT id, filename, path, volume_uuid, extension,
                            size_bytes, date_modified, date_created, is_online
                     FROM files WHERE id IN (\(placeholders))
@@ -84,26 +84,27 @@ final class LookupBenchmark: XCTestCase {
 
         // --- Strategy 3: Temp table join ---
         let t3 = try measure(iterations: 5) {
-            try self.store.connection_execute("CREATE OR REPLACE TEMP TABLE lookup_ids (id BIGINT)")
-            let appender = try self.store.createAppender(table: "lookup_ids")
-            for id in sampleIDs {
-                try appender.append(id)
-                try appender.endRow()
+            try self.store.writer_execute("CREATE OR REPLACE TEMP TABLE lookup_ids (id BIGINT)")
+            try self.store.withWriterAppender(table: "lookup_ids") { appender in
+                for id in sampleIDs {
+                    try appender.append(id)
+                    try appender.endRow()
+                }
+                try appender.flush()
             }
-            try appender.flush()
-            let _ = try self.store.connection_query("""
+            let _ = try self.store.writer_query("""
                 SELECT f.id, f.filename, f.path, f.volume_uuid, f.extension,
                        f.size_bytes, f.date_modified, f.date_created, f.is_online
                 FROM files f JOIN lookup_ids l ON f.id = l.id
             """)
-            try self.store.connection_execute("DROP TABLE IF EXISTS lookup_ids")
+            try self.store.writer_execute("DROP TABLE IF EXISTS lookup_ids")
         }
         output += "  3) Temp table + JOIN:       \(String(format: "%7.1f", t3))ms\n"
 
         // --- Strategy 4: Only 40 IDs (visible rows) ---
         let t4 = try measure(iterations: 5) {
             let placeholders = smallIDs.map { String($0) }.joined(separator: ",")
-            let _ = try self.store.connection_query("""
+            let _ = try self.store.writer_query("""
                 SELECT id, filename, path, volume_uuid, extension,
                        size_bytes, date_modified, date_created, is_online
                 FROM files WHERE id IN (\(placeholders))
