@@ -1,4 +1,4 @@
-i# Created by https://www.toptal.com/developers/gitignore/api/macos,swift
+# Created by https://www.toptal.com/developers/gitignore/api/macos,swift
 # Edit at https://www.toptal.com/developers/gitignore?templates=macos,swift
 
 ### macOS ###
@@ -119,3 +119,8 @@ fastlane/test_output
 iOSInjectionProject/
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,swift
+
+# Local benchmark artifacts. The bench harnesses write CSVs here for
+# human-readable comparison; results aren't committed (machine-specific,
+# noisy, and regenerate on demand by running the *Benchmark.swift suites).
+bench/
