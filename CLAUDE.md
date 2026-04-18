@@ -95,7 +95,7 @@ FTS5 rowid with no translation.
        segments for query performance.
      - `rebuildSearchIndex(from:vacuumAfter:)` — O(N) full rebuild. Used by
        Clear Index / Rebuild Index in Settings. `vacuumAfter` defaults to
-       false — A/B benchmarks (bench/vacuum-ab.csv) showed only a 10% rescan
+       false — A/B benchmarks (`VacuumBenchmark`) showed only a 10% rescan
        win at 27K rows, not worth the VACUUM cost on large indexes.
    - FTS5 trigger SQL lives in one `createFTS5Triggers(_:)` helper
    - Startup trigger integrity check for crash recovery
