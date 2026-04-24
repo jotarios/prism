@@ -121,7 +121,11 @@ final class BulkScanner {
                     let namePtr = nameRefPtr.advanced(by: Int(nameOffset))
                     let nameEnd = nameRefPtr.advanced(by: Int(nameOffset) + Int(nameLength))
                     let entryEnd = entryStart.advanced(by: entryLength)
-                    if nameLength > 1 && nameEnd <= entryEnd {
+                    // nameOffset is signed (Int32) per attrreference_t. macOS
+                    // never returns negative offsets in practice, but a negative
+                    // value would walk namePtr backwards into prior memory while
+                    // still satisfying the nameEnd <= entryEnd upper bound.
+                    if nameLength > 1 && nameOffset >= 0 && namePtr >= entryStart && nameEnd <= entryEnd {
                         filename = String(
                             decoding: UnsafeBufferPointer(start: namePtr.assumingMemoryBound(to: UInt8.self),
                                                           count: Int(nameLength) - 1),
