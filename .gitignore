@@ -124,3 +124,11 @@ iOSInjectionProject/
 # human-readable comparison; results aren't committed (machine-specific,
 # noisy, and regenerate on demand by running the *Benchmark.swift suites).
 bench/
+
+# Environment files — no app code reads these today, but keep them out of
+# history so a future contributor adding an API key can't leak it.
+.env
+.env.*
+
+# gstack tool outputs (security reports, analytics, session state).
+.gstack/
