@@ -28,6 +28,11 @@ final class DatabaseManager {
     private var dbPool: DatabasePool!
     let dbPath: String
 
+    /// Becomes true after open() succeeds. Callers that race ahead (e.g.
+    /// search debounce firing during cold-start) should bail early instead
+    /// of force-unwrapping `dbPool`.
+    private(set) var isOpen: Bool = false
+
     private init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let prismDir = appSupport.appendingPathComponent("Prism", isDirectory: true)
@@ -35,10 +40,7 @@ final class DatabaseManager {
         dbPath = prismDir.appendingPathComponent("index.db").path
     }
 
-    /// Testable initializer — takes an explicit DB path so tests and
-    /// benchmarks can run isolated against temp files instead of clobbering
-    /// the production `~/Library/Application Support/Prism/index.db` that
-    /// the `.shared` singleton owns.
+    /// Test-only — bypasses the production ~/Library path owned by `.shared`.
     init(testPath: String) {
         self.dbPath = testPath
     }
@@ -63,9 +65,11 @@ final class DatabaseManager {
         try checkIntegrity()
         try handleMigrations()
         try ensureTriggersExist()
+        isOpen = true
     }
 
     func close() {
+        isOpen = false
         dbPool = nil
     }
 
@@ -114,10 +118,7 @@ final class DatabaseManager {
 
     // MARK: - FTS5 Trigger Definitions
 
-    /// Creates the three FTS5 sync triggers. Idempotent (`IF NOT EXISTS`).
-    /// Callers that need to drop-then-recreate should `DROP TRIGGER IF EXISTS`
-    /// first; this helper never drops.
-    /// Static so it can be called from migration closures without capturing self.
+    /// Idempotent. Static so migration closures can call it without self.
     fileprivate static func createFTS5Triggers(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
@@ -169,26 +170,20 @@ final class DatabaseManager {
 
     // MARK: - Sync from DuckDB
 
-    /// Full rebuild of the SQLite search index from DuckDB. Used by Clear
-    /// Index / Rebuild Index and by first-time sync. Scan-time callers should
-    /// prefer `syncSearchIndex(from:volumeUUID:diff:)` which is O(delta).
-    /// - Parameter vacuumAfter: If true, runs `VACUUM` after the rebuild
-    ///   commits. Default is false because A/B benchmarks (bench/vacuum-ab.csv)
-    ///   show only a ~10% rescan win at 27K rows — not enough to justify the
-    ///   VACUUM cost, which grows with DB size. The original 8.55s production
-    ///   slowdown that prompted this was not reproduced in a controlled
-    ///   benchmark; the cause is still unidentified.
+    /// O(N) full rebuild. Used by Clear Index / Rebuild Index. Scan-time
+    /// callers want syncSearchIndex(from:volumeUUID:diff:) which is O(delta).
+    ///
+    /// vacuumAfter default is false: bench/vacuum-ab.csv showed only a ~10%
+    /// rescan win at 27K rows, not worth the VACUUM cost on large DBs.
     func rebuildSearchIndex(from store: DuckDBStore, vacuumAfter: Bool = false) throws {
-        // Snapshot all records from DuckDB first (outside the SQLite transaction
-        // so we don't hold a write lock while reading from the other DB).
+        // Snapshot outside the write txn so we don't hold a SQLite write
+        // lock while reading from DuckDB.
         var allRecords: [SyncRecord] = []
         try store.iterateAllForSync { batch in
             allRecords.append(contentsOf: batch)
         }
 
-        // Perform the entire replacement — drop triggers, wipe files, bulk
-        // insert, restore triggers, rebuild FTS5 — inside a single write
-        // transaction. Any failure rolls back to the previous good state.
+        // Full replacement in one transaction — rolls back on failure.
         try dbPool.write { db in
             try db.execute(sql: "DROP TRIGGER IF EXISTS files_ai")
             try db.execute(sql: "DROP TRIGGER IF EXISTS files_ad")
@@ -205,12 +200,9 @@ final class DatabaseManager {
             try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
         }
 
-        // Reclaim pages freed by the DELETE above. Without this, a Clear
-        // Index → rescan cycle leaves the index.db file bloated from its
-        // previous contents, and the next scan's per-row INSERT triggers
-        // churn on the free list. VACUUM can't run inside a transaction,
-        // so it goes after the write block. Runs outside `dbPool.write`
-        // because VACUUM takes its own exclusive lock.
+        // VACUUM takes its own exclusive lock, can't run in a transaction.
+        // Without it, Clear→rescan leaves the file bloated and the next
+        // scan's per-row INSERT triggers churn on the free list.
         if vacuumAfter {
             try dbPool.writeWithoutTransaction { db in
                 try db.execute(sql: "VACUUM")
@@ -226,12 +218,8 @@ final class DatabaseManager {
         }
     }
 
-    /// Incremental sync: apply a pre-computed `ScanDiff` to SQLite + FTS5 in
-    /// a single write transaction. Triggers stay in place; they propagate
-    /// each per-row change to FTS5 cheaply. Cost is O(|added ∪ modified ∪
-    /// removed|) rather than O(N).
-    ///
-    /// Callers: `SearchViewModel.scanVolume` after `DuckDBStore.mergeAndDiff`.
+    /// O(|diff|) incremental sync. Triggers stay in place and propagate
+    /// per-row changes to FTS5. Called after DuckDBStore.mergeAndDiff.
     func syncSearchIndex(from store: DuckDBStore, volumeUUID: String, diff: ScanDiff) throws {
         guard !diff.isEmpty else {
             Log.debug("syncSearchIndex: empty diff for volume=\(volumeUUID), skipping")
@@ -239,9 +227,7 @@ final class DatabaseManager {
         }
 
         try dbPool.write { db in
-            // DELETEs. Chunked at 500 to stay comfortably below SQLite's
-            // SQLITE_MAX_VARIABLE_NUMBER (default 32_766 in 3.32+, but older
-            // builds cap at 999; we keep headroom).
+            // 500 stays under SQLITE_MAX_VARIABLE_NUMBER (older builds cap at 999).
             if !diff.removedIds.isEmpty {
                 for chunk in diff.removedIds.chunked(into: 500) {
                     let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
@@ -252,8 +238,7 @@ final class DatabaseManager {
                 }
             }
 
-            // INSERT OR REPLACE for added ∪ modified. The files_ai and
-            // files_au triggers handle FTS5 propagation row-by-row.
+            // files_ai / files_au triggers handle FTS5 propagation.
             let mutationCount = diff.added.count + diff.modified.count + diff.removedIds.count
             if !diff.added.isEmpty || !diff.modified.isEmpty {
                 let stmt = try db.cachedStatement(
@@ -267,12 +252,8 @@ final class DatabaseManager {
                 }
             }
 
-            // After bulk mutations, FTS5 is left with many small segments
-            // that drag down MATCH + ORDER BY rank for common prefixes.
-            // `rebuild` reconstructs the whole index from `files` in a
-            // single optimally-packed segment — same structure main's
-            // bulk-rebuild sync path produces. Only worth the cost when we
-            // just mutated a lot of rows.
+            // 'rebuild' repacks FTS5 segments — drops MATCH latency on
+            // common prefixes. Worth the cost above 1000 mutations.
             if mutationCount >= 1000 {
                 try db.execute(sql: "INSERT INTO files_fts(files_fts) VALUES('rebuild')")
             }
@@ -292,6 +273,9 @@ final class DatabaseManager {
 
     func searchFileIDs(query: String, limit: Int = 1000) async throws -> [Int64] {
         guard !query.isEmpty else { return [] }
+        // Cold-start race: search debounce / live-index callback can fire
+        // before open() completes. Bail rather than trap the IUO dbPool.
+        guard isOpen else { return [] }
 
         return try await dbPool.read { db in
             let sanitized = query
@@ -318,7 +302,8 @@ final class DatabaseManager {
     // MARK: - Query Operations
 
     func getFileCount() async throws -> Int {
-        try await dbPool.read { db in
+        guard isOpen else { return 0 }
+        return try await dbPool.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
         }
     }

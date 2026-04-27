@@ -114,11 +114,15 @@ final class MultiConnectionTests: XCTestCase {
         XCTAssertTrue(errors.isEmpty, "concurrent TEMP-table readers must not interfere: \(errors)")
     }
 
-    /// Only one scan can run at a time. Second beginScan must throw.
+    /// Post-Phase-3: per-volume scan slots. Same-volume double-begin throws;
+    /// different-volume begin succeeds. The writer NSLock still serializes
+    /// actual disk writes — see MultiVolumeConcurrentScanTests for the
+    /// invariant we keep.
     func testWriterSerialization() throws {
         try store.beginScan(volumeUUID: "A")
 
-        XCTAssertThrowsError(try store.beginScan(volumeUUID: "B")) { err in
+        // Same volume → still throws (double-begin guard).
+        XCTAssertThrowsError(try store.beginScan(volumeUUID: "A")) { err in
             guard case IndexError.scanAlreadyInProgress(let vol) = err else {
                 XCTFail("expected scanAlreadyInProgress, got \(err)")
                 return
@@ -126,8 +130,10 @@ final class MultiConnectionTests: XCTestCase {
             XCTAssertEqual(vol, "A")
         }
 
+        // Different volume → succeeds (per-volume slots from Phase 3).
+        XCTAssertNoThrow(try store.beginScan(volumeUUID: "B"))
+
         _ = try store.mergeAndDiff(volumeUUID: "A")
-        try store.beginScan(volumeUUID: "B")
         _ = try store.mergeAndDiff(volumeUUID: "B")
     }
 

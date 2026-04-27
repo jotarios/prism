@@ -170,16 +170,17 @@ final class IncrementalSyncTests: XCTestCase {
 
     // MARK: - Concurrency guard
 
-    func testBeginScanThrowsIfAlreadyInProgress() throws {
+    /// Post-Phase-3 semantics: beginScan on a DIFFERENT volume while another
+    /// is in flight is now ALLOWED (each volume owns its own staging table
+    /// and slot). The old test here rejected volB while volA was held —
+    /// that's no longer the contract. The double-begin-same-volume invariant
+    /// is covered in MultiVolumeConcurrentScanTests.
+    func testBeginScanAllowsDifferentVolumeWhileInProgress() throws {
         _ = try store.beginScan(volumeUUID: volA)
-        XCTAssertThrowsError(try store.beginScan(volumeUUID: volB)) { error in
-            guard case IndexError.scanAlreadyInProgress(let held) = error else {
-                return XCTFail("Expected scanAlreadyInProgress, got \(error)")
-            }
-            XCTAssertEqual(held, volA)
-        }
-        // Cleanup: release the slot.
+        XCTAssertNoThrow(try store.beginScan(volumeUUID: volB))
+        // Both slots are held; clean up in order.
         _ = try store.mergeAndDiff(volumeUUID: volA)
+        _ = try store.mergeAndDiff(volumeUUID: volB)
     }
 
     func testMergeReleasesSlotSoNextScanCanStart() throws {

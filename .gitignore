@@ -132,3 +132,6 @@ bench/
 
 # gstack tool outputs (security reports, analytics, session state).
 .gstack/
+
+# Claude Code session state (lock files, scheduled tasks).
+.claude/

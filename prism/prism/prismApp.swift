@@ -6,9 +6,12 @@
 //
 
 import SwiftUI
+import AppKit
 
 @main
 struct prismApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
         WindowGroup {
             MainWindow()
@@ -19,10 +22,19 @@ struct prismApp: App {
             CommandGroup(replacing: .newItem) { }
         }
 
-        // Settings window
         Settings {
             SettingsView(viewModel: SearchViewModel.shared)
                 .frame(minWidth: 600, minHeight: 500)
+        }
+    }
+}
+
+/// Removes NSWorkspace observers on quit. applicationWillTerminate runs
+/// on the main thread, so assumeIsolated is safe.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            SearchViewModel.shared.tearDownLiveIndex()
         }
     }
 }

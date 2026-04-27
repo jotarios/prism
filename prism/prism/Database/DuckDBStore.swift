@@ -13,10 +13,14 @@ enum IndexError: Error {
     case invalidVolumeUUID(String)
 }
 
-// Thread-safe DuckDB store. Writes flow through a single writer connection;
-// reads flow through a pool of reader connections. The in-memory cache has
-// its own lock, separate from the DuckDB layer. `currentScanVolume` is
-// accessed only inside `writer.sync { }`, so its mutations are serialized.
+// Writes flow through a single writer connection; reads flow through a
+// pool of reader connections. In-memory SearchResult cache lives in
+// `cache` (DuckDBCache); volume_watch_state CRUD in `watchState`
+// (VolumeWatchStateStore). This type owns the `files` table and the
+// scan lifecycle.
+//
+// `currentScanVolumes` and `pendingBatches` are accessed only inside
+// `writer.sync { }`, so they're serialized by the writer NSLock.
 nonisolated final class DuckDBStore: @unchecked Sendable {
     static let defaultReaderCount = 3
 
@@ -24,25 +28,18 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
     let writer: WriterConnection
     let readers: ReaderPool
     let dbPath: String
+    let cache: DuckDBCache
+    let watchState: VolumeWatchStateStore
 
-    private let cacheLock = NSLock()
-    private var cache: [Int64: SearchResult] = [:]
-    private var cacheLoaded = false
+    // Per-volume scan slots. beginScan adds; mergeAndDiff removes. Two
+    // different volumes can scan concurrently at the staging-INSERT level
+    // (each has its own staging table), but `mergeAndDiff` and
+    // `applyDirectDiff` still serialize on the writer NSLock.
+    private var currentScanVolumes: Set<String> = []
 
-    // Scan slot. `beginScan` sets this to the active volume; `mergeAndDiff`
-    // clears it. A non-nil value blocks concurrent scans *on this volume*.
-    // A concurrent ingestBatch for a different volumeUUID will take the
-    // `ingestDirectOnWriter` path and write directly to `files` — this is
-    // only used by tests and one-shots; production scan paths all come
-    // through beginScan first. All reads/writes of this field happen inside
-    // `writer.sync { }`, so no extra lock is needed.
-    private var currentScanVolume: String?
-
-    private func withCacheLock<T>(_ body: () throws -> T) rethrows -> T {
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
-        return try body()
-    }
+    // FSEvents batches for volumes mid-scan. Applied after mergeAndDiff
+    // releases the slot, so direct-diff doesn't race with the merge SQL.
+    private var pendingBatches: [String: [ScanDiff]] = [:]
 
     init(path: String? = nil, readerCount: Int = DuckDBStore.defaultReaderCount) throws {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -55,6 +52,8 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
         database = try Database(store: .file(at: URL(fileURLWithPath: resolvedPath)))
         writer = try WriterConnection(database: database)
         readers = try ReaderPool(database: database, count: readerCount)
+        cache = DuckDBCache()
+        watchState = VolumeWatchStateStore(writer: writer, readers: readers)
         try createSchema()
         try cleanupOrphanedStaging()
     }
@@ -75,18 +74,36 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 )
             """)
             try conn.execute("CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_uuid)")
-            // Uniqueness of (volume_uuid, path) is enforced indirectly via the
-            // `id` PRIMARY KEY, since id = PathHash.id(volume_uuid, path). A
-            // dedicated UNIQUE index on (volume_uuid, path) costs per-row index
-            // maintenance on every INSERT and isn't needed for correctness —
-            // merge joins use id, not (volume, path).
+            // id = PathHash(volume_uuid, path) is the PK, so (volume_uuid,
+            // path) uniqueness is already implied. An explicit unique index
+            // would cost per-row maintenance; merge joins use id anyway.
+
+            try conn.execute("""
+                CREATE TABLE IF NOT EXISTS volume_watch_state (
+                    volume_uuid VARCHAR PRIMARY KEY,
+                    last_event_id BIGINT NOT NULL,
+                    last_seen_at BIGINT NOT NULL,
+                    polling_mode BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_reason VARCHAR
+                )
+            """)
+
+            // last_scanned_at is the user-facing "Last scanned X ago"
+            // timestamp shown in Settings. Set once at the end of a
+            // successful mergeAndDiff. Not folded into volume_watch_state
+            // because that updates on every FSEvents checkpoint and
+            // wouldn't reflect "last full scan" semantics.
+            try conn.execute("""
+                CREATE TABLE IF NOT EXISTS volume_scan_state (
+                    volume_uuid VARCHAR PRIMARY KEY,
+                    last_scanned_at BIGINT NOT NULL
+                )
+            """)
         }
     }
 
-    /// Drop any staging tables left behind by a crashed scan. Called once at
-    /// init. Staging tables follow the pattern `files_staging_<sanitized_uuid>`.
-    /// Internal rather than private so tests can drive it without juggling
-    /// DuckDB's process-level file lock.
+    /// Drop staging tables left behind by a crashed scan. Runs at init.
+    /// `internal` so tests can drive it.
     internal func cleanupOrphanedStaging() throws {
         try writer.sync { conn in
             let result = try conn.query("""
@@ -96,8 +113,6 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
             let col = result[0].cast(to: String.self)
             for idx in 0..<result.rowCount {
                 guard let name = col[idx] else { continue }
-                // Table name came from information_schema; safe to interpolate
-                // back after quoting. Still double-quote to be defensive.
                 try conn.execute("DROP TABLE IF EXISTS \"\(name)\"")
                 Log.debug("Dropped orphaned staging table: \(name)")
             }
@@ -124,13 +139,11 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
 
     // MARK: - Scan Lifecycle
 
-    /// Begin a scan of `volumeUUID`. Acquires the scan slot and (re)creates
-    /// an empty per-volume staging table. Concurrent scans throw
-    /// `scanAlreadyInProgress`.
+    /// Same-volume double-begin throws; different-volume begin succeeds.
     func beginScan(volumeUUID: String) throws {
         try writer.sync { conn in
-            if let existing = currentScanVolume {
-                throw IndexError.scanAlreadyInProgress(volumeUUID: existing)
+            if currentScanVolumes.contains(volumeUUID) {
+                throw IndexError.scanAlreadyInProgress(volumeUUID: volumeUUID)
             }
 
             let staging = try DuckDBStore.stagingTableName(for: volumeUUID)
@@ -148,23 +161,24 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 )
             """)
 
-            currentScanVolume = volumeUUID
-            Log.debug("beginScan volume=\(volumeUUID)")
+            currentScanVolumes.insert(volumeUUID)
+            Log.debug("beginScan volume=\(volumeUUID) (active volumes: \(currentScanVolumes.count))")
         }
+    }
+
+    func isScanning(volumeUUID: String) -> Bool {
+        writer.sync { _ in currentScanVolumes.contains(volumeUUID) }
     }
 
     // MARK: - Ingestion
 
-    /// Ingest a batch of scanned files. When a scan is active (beginScan was
-    /// called and mergeAndDiff hasn't yet run), rows land in the per-volume
-    /// staging table. Otherwise — tests, one-shots — this routes through a
-    /// direct Appender into `files` with hash-derived ids. That path is fast
-    /// on an empty or newly-deleted-for-volume table; if the caller ingests
-    /// the same (volume, path) twice, the second call violates the UNIQUE
-    /// constraint (use beginScan/mergeAndDiff for idempotent rescans).
+    /// During a scan, rows go to per-volume staging. Otherwise (tests,
+    /// one-shots) they Appender-insert into `files` directly — caller must
+    /// not re-insert the same (volume, path) since Appender doesn't support
+    /// ON CONFLICT; use beginScan/mergeAndDiff for idempotent rescans.
     func ingestBatch(_ files: [ScannedFile], volumeUUID: String) throws {
         try writer.sync { conn in
-            if let scanning = currentScanVolume, scanning == volumeUUID {
+            if currentScanVolumes.contains(volumeUUID) {
                 try ingestToStagingOnWriter(conn: conn, files: files, volumeUUID: volumeUUID)
             } else {
                 try ingestDirectOnWriter(conn: conn, files: files, volumeUUID: volumeUUID)
@@ -193,10 +207,6 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
         try appender.flush()
     }
 
-    /// Direct Appender into `files`. Fast path for non-scan callers (tests,
-    /// one-shots). Caller is responsible for not re-inserting the same
-    /// (volume_uuid, path) — would trip the PK via hash equality. The
-    /// scan-time path uses staging + merge to handle rescans safely.
     private func ingestDirectOnWriter(conn: Connection, files: [ScannedFile], volumeUUID: String) throws {
         let appender = try Appender(connection: conn, table: "files")
         for file in files {
@@ -218,18 +228,14 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
 
     // MARK: - Merge
 
-    /// Compute the scan's diff against `files`, apply it to DuckDB, drop the
-    /// staging table, release the scan slot, and return the diff so the
-    /// SQLite sync step can propagate the same set of changes.
-    ///
-    /// SQL shape (three logical queries, one transaction):
-    ///   added    = staging rows whose (volume, path) isn't in files
-    ///   modified = staging rows whose (volume, path) is in files but
-    ///              (size_bytes, date_modified) differ
-    ///   removed  = files rows (for this volume) whose (path) isn't in staging
+    /// Diff against `files`, apply, drop the staging table, release the
+    /// scan slot. SQL shape (three queries, one transaction):
+    ///   added    = staging rows whose id isn't in files
+    ///   modified = matching id but differing (size_bytes, date_modified)
+    ///   removed  = files rows for this volume whose id isn't in staging
     func mergeAndDiff(volumeUUID: String) throws -> ScanDiff {
         try writer.sync { conn in
-            guard let scanning = currentScanVolume, scanning == volumeUUID else {
+            guard currentScanVolumes.contains(volumeUUID) else {
                 throw IndexError.noActiveScan
             }
 
@@ -243,16 +249,8 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
             do {
                 let quotedVolume = "'\(volumeUUID.replacingOccurrences(of: "'", with: "''"))'"
 
-                // Joins use `id` (= PathHash.id(volume, path)) rather than
-                // (volume_uuid, path). The PK gives us a hash lookup instead
-                // of a two-column scan, and the semantics are identical by
-                // construction: same id ⇔ same (volume, path).
-
-                // --- ADDED: staging rows whose id isn't in files. Select
-                // the full row so callers can populate the cache without a
-                // second IN (...) round-trip. Staging tables hold the same
-                // columns as `files` minus is_online (which is always TRUE
-                // for newly-added rows).
+                // Selecting the full staging row keeps applyDiff in-memory —
+                // no IN(...) round-trip to DuckDB to rehydrate the cache.
                 let addedResult = try conn.query("""
                     SELECT s.id, s.filename, s.path, s.volume_uuid, s.extension,
                            s.size_bytes, s.date_modified, s.date_created
@@ -262,8 +260,6 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 """)
                 added = extractEntries(from: addedResult)
 
-                // --- MODIFIED: matching id, differing (size, mtime). Return
-                // the staging values (the new state), same columns as added.
                 let modifiedResult = try conn.query("""
                     SELECT s.id, s.filename, s.path, s.volume_uuid, s.extension,
                            s.size_bytes, s.date_modified, s.date_created
@@ -273,7 +269,6 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 """)
                 modified = extractEntries(from: modifiedResult)
 
-                // --- REMOVED: files rows on this volume whose id isn't in staging.
                 let removedResult = try conn.query("""
                     SELECT f.id FROM files f
                     LEFT JOIN "\(staging)" s ON s.id = f.id
@@ -282,7 +277,8 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 """)
                 removedIds = extractIds(from: removedResult)
 
-                // --- Apply to DuckDB. Order matters: INSERT before DELETE.
+                // INSERT before DELETE matters — deleting then inserting
+                // the same id in one transaction trips DuckDB's unique index.
                 if !added.isEmpty {
                     try conn.execute("""
                         INSERT INTO files (id, filename, path, volume_uuid, extension,
@@ -295,8 +291,7 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                     """)
                 }
                 if !modified.isEmpty {
-                    // UPDATE excludes `is_online` so a Phase-5 offline flag
-                    // isn't clobbered by rescans.
+                    // UPDATE excludes is_online so offline flag survives rescan.
                     try conn.execute("""
                         UPDATE files
                         SET filename = s.filename,
@@ -310,30 +305,71 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                     """)
                 }
                 if !removedIds.isEmpty {
-                    // DuckDB has no parameter-count limit like SQLite's 32K,
-                    // but we chunk for readability and DELETE query size.
                     for chunk in removedIds.chunked(into: 1000) {
                         let list = chunk.map(String.init).joined(separator: ",")
-                        try conn.execute("""
-                            DELETE FROM files WHERE id IN (\(list))
-                        """)
+                        try conn.execute("DELETE FROM files WHERE id IN (\(list))")
                     }
                 }
+
+                // Stamp last_scanned_at inside the same transaction as
+                // the file mutations — if mergeAndDiff commits, the
+                // timestamp updates atomically with the data.
+                let now = Int64(Date().timeIntervalSince1970)
+                let ts = try PreparedStatement(connection: conn, query: """
+                    INSERT OR REPLACE INTO volume_scan_state (volume_uuid, last_scanned_at)
+                    VALUES ($1, $2)
+                """)
+                try ts.bind(volumeUUID, at: 1)
+                try ts.bind(now, at: 2)
+                _ = try ts.execute()
 
                 try conn.execute("DROP TABLE IF EXISTS \"\(staging)\"")
                 try conn.execute("COMMIT")
             } catch {
                 try? conn.execute("ROLLBACK")
-                // Leave staging table for the next beginScan to clean up.
-                currentScanVolume = nil
+                // Leave staging table behind; next init's cleanupOrphanedStaging sweeps it.
+                currentScanVolumes.remove(volumeUUID)
                 throw error
             }
 
-            currentScanVolume = nil
+            currentScanVolumes.remove(volumeUUID)
 
             let diff = ScanDiff(added: added, modified: modified, removedIds: removedIds)
             Log.debug("mergeAndDiff volume=\(volumeUUID) added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
             return diff
+        }
+    }
+
+    /// Last full scan timestamp for a volume (unix seconds), or nil if never scanned.
+    func lastScannedAt(volumeUUID: String) throws -> Foundation.Date? {
+        try readers.sync { conn in
+            let stmt = try PreparedStatement(connection: conn, query: """
+                SELECT last_scanned_at FROM volume_scan_state WHERE volume_uuid = $1
+            """)
+            try stmt.bind(volumeUUID, at: 1)
+            let result = try stmt.execute()
+            guard result.rowCount > 0 else { return nil }
+            let col = result[0].cast(to: Int64.self)
+            guard let raw = col[0] else { return nil }
+            return Foundation.Date(timeIntervalSince1970: TimeInterval(raw))
+        }
+    }
+
+    /// Drained by LiveIndexCoordinator after mergeAndDiff completes.
+    /// Returns the queued batches and clears the queue atomically.
+    func drainPendingBatches(volumeUUID: String) -> [ScanDiff] {
+        writer.sync { _ in
+            let batches = pendingBatches[volumeUUID] ?? []
+            pendingBatches.removeValue(forKey: volumeUUID)
+            return batches
+        }
+    }
+
+    /// Enqueue an FSEvents-derived diff to apply after the current scan
+    /// completes. Called by LiveIndexCoordinator when `isScanning(volumeUUID)`
+    func enqueuePendingBatch(volumeUUID: String, diff: ScanDiff) {
+        writer.sync { _ in
+            pendingBatches[volumeUUID, default: []].append(diff)
         }
     }
 
@@ -391,104 +427,37 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
     }
 
     func loadCache() throws {
-        let start = CFAbsoluteTimeGetCurrent()
-        let results: [SearchResult] = try readers.sync { conn in
-            let result = try conn.query("""
-                SELECT id, filename, path, volume_uuid, extension,
-                       size_bytes, date_modified, date_created, is_online
-                FROM files
-            """)
-            return extractSearchResults(from: result)
-        }
-        withCacheLock {
-            cache.removeAll()
-            for r in results {
-                cache[r.id] = r
+        try cache.load { [readers] in
+            try readers.sync { conn in
+                let result = try conn.query("""
+                    SELECT id, filename, path, volume_uuid, extension,
+                           size_bytes, date_modified, date_created, is_online
+                    FROM files
+                """)
+                return Self.extractSearchResults(from: result)
             }
-            cacheLoaded = true
-            Log.debug("Cache loaded: \(cache.count) entries in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - start))s")
         }
     }
 
-    func invalidateCache() {
-        withCacheLock {
-            cache.removeAll()
-            cacheLoaded = false
-        }
-    }
+    func invalidateCache() { cache.invalidate() }
 
-    /// Apply an already-computed scan diff to the in-memory cache. Builds
-    /// SearchResult values directly from the diff's payload — no DuckDB
-    /// round-trip. `mergeAndDiff` populates ScanDiff.Entry with full row
-    /// data precisely so this path stays in-memory.
-    ///
-    /// Correctness: the entry values are a snapshot from staging at merge
-    /// time, so they reflect exactly what was committed to `files`. A
-    /// subsequent scan overwriting the same ids will produce its own diff
-    /// and call applyDiff again, so there's no "stale write" risk.
-    ///
-    /// `is_online` is not in the diff because newly-added rows are always
-    /// online (is_online=TRUE in the INSERT) and modified rows keep their
-    /// previous is_online unchanged (offline handling is a future feature).
     func applyDiff(_ diff: ScanDiff) throws {
-        let isLoaded = withCacheLock { cacheLoaded }
-        guard isLoaded else { return }
-
-        var built: [SearchResult] = []
-        built.reserveCapacity(diff.added.count + diff.modified.count)
-        for entry in diff.added {
-            built.append(searchResult(from: entry, isOnline: true))
-        }
-        for entry in diff.modified {
-            // Preserve the previous is_online value from the existing cache
-            // entry if present. If the entry isn't cached (race with
-            // invalidateCache), default to TRUE — the next loadCache will
-            // reconcile.
-            let preserved = withCacheLock { cache[entry.id]?.isOnline } ?? true
-            built.append(searchResult(from: entry, isOnline: preserved))
-        }
-
-        // Apply removals and upserts in a single critical section so a
-        // concurrent search can't observe a state that's missing the old
-        // rows but doesn't yet have the new ones.
-        withCacheLock {
-            for id in diff.removedIds { cache.removeValue(forKey: id) }
-            for r in built { cache[r.id] = r }
-        }
-    }
-
-    private func searchResult(from entry: ScanDiff.Entry, isOnline: Bool) -> SearchResult {
-        SearchResult(
-            id: entry.id,
-            filename: entry.filename,
-            path: entry.path,
-            volumeUUID: entry.volumeUUID,
-            ext: entry.ext,
-            sizeBytes: entry.sizeBytes,
-            dateModified: Date(timeIntervalSince1970: Double(entry.dateModified)),
-            isOnline: isOnline,
-            durationSeconds: nil
-        )
+        cache.applyDiff(diff)
     }
 
     func getAllCachedValues() -> [SearchResult] {
-        withCacheLock { Array(cache.values) }
+        cache.allValues()
     }
 
     func getFilesByIDs(_ ids: [Int64]) throws -> [SearchResult] {
         guard !ids.isEmpty else { return [] }
 
-        let hot: [SearchResult]? = withCacheLock {
-            cacheLoaded ? ids.compactMap { cache[$0] } : nil
-        }
-        if let hot { return hot }
+        if let hot = cache.results(for: ids) { return hot }
 
         return try readers.sync { conn in
             try conn.execute("CREATE OR REPLACE TEMP TABLE _lookup (id BIGINT, ord BIGINT)")
-            // Ensure the TEMP table is dropped even if appender/query throws.
-            // Otherwise it sticks around on this reader's connection (TEMP
-            // tables are connection-local) and leaks until the connection is
-            // closed.
+            // TEMP tables are connection-local; drop on all paths or they
+            // leak until the connection closes.
             defer { try? conn.execute("DROP TABLE IF EXISTS _lookup") }
 
             let appender = try Appender(connection: conn, table: "_lookup")
@@ -505,15 +474,12 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 FROM files f JOIN _lookup l ON f.id = l.id
                 ORDER BY l.ord
             """)
-            return extractSearchResults(from: result)
+            return Self.extractSearchResults(from: result)
         }
     }
 
     func getAllFiles(limit: Int = 1000) throws -> [SearchResult] {
-        let hot: [SearchResult]? = withCacheLock {
-            cacheLoaded ? Array(cache.values.sorted { $0.dateModified > $1.dateModified }.prefix(limit)) : nil
-        }
-        if let hot { return hot }
+        if let hot = cache.allSortedByDateDesc(limit: limit) { return hot }
 
         return try readers.sync { conn in
             let stmt = try PreparedStatement(connection: conn, query: """
@@ -523,11 +489,11 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
             """)
             try stmt.bind(Int64(limit), at: 1)
             let result = try stmt.execute()
-            return extractSearchResults(from: result)
+            return Self.extractSearchResults(from: result)
         }
     }
 
-    private func extractSearchResults(from result: ResultSet) -> [SearchResult] {
+    static func extractSearchResults(from result: ResultSet) -> [SearchResult] {
         let idCol = result[0].cast(to: Int64.self)
         let filenameCol = result[1].cast(to: String.self)
         let pathCol = result[2].cast(to: String.self)
@@ -565,9 +531,9 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
 
     // MARK: - Sync to SQLite
 
+    /// Handler runs OUTSIDE the reader closure so SQLite writes in the
+    /// handler don't hold a DuckDB reader connection.
     func iterateAllForSync(batchSize: Int = 10_000, handler: ([SyncRecord]) throws -> Void) throws {
-        // Snapshot all rows on a reader connection (MVCC; writer not blocked).
-        // Handler runs outside the reader so SQLite writes don't block DuckDB.
         var allRecords: [SyncRecord] = []
         try readers.sync { conn in
             let result = try conn.query("SELECT id, filename, extension FROM files")
@@ -598,16 +564,15 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
         }
     }
 
-    // MARK: - Internal Access (for benchmarks)
+    // MARK: - Benchmark escape hatches
+    //
+    // These bypass the typed scan/query API (beginScan/ingestBatch/mergeAndDiff).
+    // Benchmarks only — do not use from production code paths.
 
     func cachedResult(for id: Int64) -> SearchResult? {
-        withCacheLock { cache[id] }
+        cache.result(for: id)
     }
 
-    // Writer-path escape hatches for benchmarks only. Each call fully
-    // serializes through `writer.sync`. Do NOT use for production code paths
-    // — the typed API above (beginScan, ingestBatch, mergeAndDiff, …) is
-    // what's been validated for correctness.
     func writer_query(_ sql: String) throws -> ResultSet {
         try writer.sync { conn in try conn.query(sql) }
     }
@@ -616,10 +581,7 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
         try writer.sync { conn in try conn.execute(sql) }
     }
 
-    /// Run `body` with an Appender bound to the writer connection. The
-    /// Appender and its flush happen entirely inside the writer lock, so
-    /// nothing else can write to this connection in parallel. The Appender
-    /// must not escape the closure.
+    /// Appender must not escape the closure.
     func withWriterAppender<T>(table: String, _ body: (Appender) throws -> T) throws -> T {
         try writer.sync { conn in
             let appender = try Appender(connection: conn, table: table)
@@ -627,14 +589,12 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
         }
     }
 
-    /// Reader-path escape hatch for benchmarks that need raw SELECT access
-    /// on a reader connection (e.g. to time cache-miss paths directly).
     func reader_query(_ sql: String) throws -> ResultSet {
         try readers.sync { conn in try conn.query(sql) }
     }
 
     func extractResults(from result: ResultSet) -> [SearchResult] {
-        extractSearchResults(from: result)
+        Self.extractSearchResults(from: result)
     }
 
     // MARK: - DuckDB-native Search
@@ -649,21 +609,156 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
             try stmt.bind("%" + query + "%", at: 1)
             try stmt.bind(Int64(limit), at: 2)
             let result = try stmt.execute()
-            return extractSearchResults(from: result)
+            return Self.extractSearchResults(from: result)
         }
+    }
+
+    // MARK: - Direct Diff (Phase 3 — FSEvents hot path)
+
+    /// Apply a diff without going through the staging-table merge. Writer
+    /// NSLock is released between 1k-row chunks so concurrent writers
+    /// (full scans, Clear Index) don't starve on a large FSEvents burst.
+    ///
+    /// is_online is not updated: always TRUE on INSERT; UPDATE omits it so
+    /// the offline flag survives rescans.
+    func applyDirectDiff(_ diff: ScanDiff, volumeUUID: String) throws {
+        guard !diff.isEmpty else { return }
+
+        let chunkSize = 1000
+
+        // Must be idempotent — FSEvents replay sends the same events after
+        // app restart via HistoryDone. Appender doesn't support ON CONFLICT;
+        // DELETE+Appender in one transaction trips DuckDB's unique-constraint
+        // index (the index isn't invalidated until commit). Per-row prepared
+        // INSERT is slower than Appender but correct.
+        let addedChunks = diff.added.chunked(into: chunkSize)
+        for chunk in addedChunks {
+            try writer.sync { conn in
+                try conn.execute("BEGIN TRANSACTION")
+                do {
+                    let stmt = try PreparedStatement(connection: conn, query: """
+                        INSERT INTO files
+                            (id, filename, path, volume_uuid, extension,
+                             size_bytes, date_modified, date_created, is_online)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+                        ON CONFLICT (id) DO UPDATE SET
+                            filename = EXCLUDED.filename,
+                            path = EXCLUDED.path,
+                            extension = EXCLUDED.extension,
+                            size_bytes = EXCLUDED.size_bytes,
+                            date_modified = EXCLUDED.date_modified,
+                            date_created = EXCLUDED.date_created
+                            -- volume_uuid omitted: DuckDB forbids UPDATE SET
+                            -- on indexed columns (idx_files_volume).
+                    """)
+                    for entry in chunk {
+                        try stmt.bind(entry.id, at: 1)
+                        try stmt.bind(entry.filename, at: 2)
+                        try stmt.bind(entry.path, at: 3)
+                        try stmt.bind(entry.volumeUUID, at: 4)
+                        try stmt.bind(entry.ext, at: 5)
+                        try stmt.bind(entry.sizeBytes, at: 6)
+                        try stmt.bind(entry.dateModified, at: 7)
+                        try stmt.bind(entry.dateCreated, at: 8)
+                        _ = try stmt.execute()
+                    }
+                    try conn.execute("COMMIT")
+                } catch {
+                    try? conn.execute("ROLLBACK")
+                    throw error
+                }
+            }
+        }
+
+        let modifiedChunks = diff.modified.chunked(into: chunkSize)
+        for chunk in modifiedChunks {
+            try writer.sync { conn in
+                try conn.execute("BEGIN TRANSACTION")
+                do {
+                    // ~200μs/update × 1000 ≈ 200ms per chunk. Within budget.
+                    let stmt = try PreparedStatement(connection: conn, query: """
+                        UPDATE files
+                        SET filename = $1,
+                            extension = $2,
+                            size_bytes = $3,
+                            date_modified = $4,
+                            date_created = $5
+                        WHERE id = $6
+                    """)
+                    for entry in chunk {
+                        try stmt.bind(entry.filename, at: 1)
+                        try stmt.bind(entry.ext, at: 2)
+                        try stmt.bind(entry.sizeBytes, at: 3)
+                        try stmt.bind(entry.dateModified, at: 4)
+                        try stmt.bind(entry.dateCreated, at: 5)
+                        try stmt.bind(entry.id, at: 6)
+                        _ = try stmt.execute()
+                    }
+                    try conn.execute("COMMIT")
+                } catch {
+                    try? conn.execute("ROLLBACK")
+                    throw error
+                }
+            }
+        }
+
+        let removedChunks = diff.removedIds.chunked(into: chunkSize)
+        for chunk in removedChunks {
+            try writer.sync { conn in
+                try conn.execute("BEGIN TRANSACTION")
+                do {
+                    let list = chunk.map(String.init).joined(separator: ",")
+                    try conn.execute("DELETE FROM files WHERE id IN (\(list))")
+                    try conn.execute("COMMIT")
+                } catch {
+                    try? conn.execute("ROLLBACK")
+                    throw error
+                }
+            }
+        }
+
+        Log.debug("applyDirectDiff volume=\(volumeUUID) +\(diff.added.count) ~\(diff.modified.count) -\(diff.removedIds.count)")
+    }
+
+    /// ~50-150ms on a 1M-row volume; one-shot per mount/unmount.
+    func setVolumeOnline(_ volumeUUID: String, isOnline: Bool) throws {
+        try writer.sync { conn in
+            let stmt = try PreparedStatement(connection: conn, query: """
+                UPDATE files SET is_online = $1 WHERE volume_uuid = $2
+            """)
+            try stmt.bind(isOnline, at: 1)
+            try stmt.bind(volumeUUID, at: 2)
+            _ = try stmt.execute()
+        }
+        cache.setVolumeOnline(volumeUUID, isOnline: isOnline)
+    }
+
+    // MARK: - Volume watch-state facades
+
+    func persistEventId(volumeUUID: String, lastEventId: UInt64, reason: String? = nil) throws {
+        try watchState.persistEventId(volumeUUID: volumeUUID, lastEventId: lastEventId, reason: reason)
+    }
+
+    func loadWatchState(volumeUUID: String) throws -> (lastEventId: UInt64, pollingMode: Bool)? {
+        try watchState.load(volumeUUID: volumeUUID)
+    }
+
+    func setPollingMode(volumeUUID: String, enabled: Bool) throws {
+        try watchState.setPollingMode(volumeUUID: volumeUUID, enabled: enabled)
+    }
+
+    func maxDateModified(volumeUUID: String) throws -> Int64? {
+        try watchState.maxDateModified(volumeUUID: volumeUUID)
     }
 
     // MARK: - Volume Operations
 
     func deleteFilesByVolume(_ volumeUUID: String) throws {
-        // Drop cache entries *before* the DuckDB DELETE commits. A concurrent
-        // search hitting the cache between the two can only miss (→ falls
-        // through to reader query, which sees the row until DELETE commits,
-        // and then won't see it after). Cached hit returning a row that no
-        // longer exists is the stale-data failure mode we avoid.
-        withCacheLock {
-            cache = cache.filter { $0.value.volumeUUID != volumeUUID }
-        }
+        // Drop cache BEFORE the DuckDB DELETE. Concurrent search between
+        // the two can only miss (→ falls through to reader, which still
+        // sees the row until the DELETE commits). Stale cache hit for a
+        // deleted row is the failure mode we avoid.
+        cache.dropVolume(volumeUUID)
         try writer.sync { conn in
             #if DEBUG
             let resultBefore = try conn.query("SELECT COUNT(*) FROM files")
@@ -681,10 +776,7 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
     }
 
     func clearAll() throws {
-        withCacheLock {
-            cache.removeAll()
-            cacheLoaded = false
-        }
+        cache.invalidate()
         try writer.sync { conn in
             try conn.execute("DELETE FROM files")
         }
