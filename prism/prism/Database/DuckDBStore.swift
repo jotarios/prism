@@ -10,6 +10,7 @@ enum IndexError: Error {
     case scanAlreadyInProgress(volumeUUID: String)
     case noActiveScan
     case hashCollision(path: String, volumeUUID: String)
+    case invalidVolumeUUID(String)
 }
 
 // Writes flow through a single writer connection; reads flow through a
@@ -118,12 +119,22 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
         }
     }
 
-    private static func sanitizeVolumeForTable(_ uuid: String) -> String {
-        uuid.replacingOccurrences(of: "-", with: "_")
+    /// Replace UUID characters that are awkward in identifiers, then enforce
+    /// an allowlist. macOS `volumeUUIDStringKey` always returns canonical
+    /// CFUUID format (hex digits + hyphens), so any character outside
+    /// `[0-9A-Za-z_]` means the UUID came from somewhere we don't trust —
+    /// throw instead of interpolating into SQL.
+    private static func sanitizeVolumeForTable(_ uuid: String) throws -> String {
+        let sanitized = uuid.replacingOccurrences(of: "-", with: "_")
+        guard !sanitized.isEmpty,
+              sanitized.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }) else {
+            throw IndexError.invalidVolumeUUID(uuid)
+        }
+        return sanitized
     }
 
-    private static func stagingTableName(for volumeUUID: String) -> String {
-        "files_staging_\(sanitizeVolumeForTable(volumeUUID))"
+    private static func stagingTableName(for volumeUUID: String) throws -> String {
+        "files_staging_\(try sanitizeVolumeForTable(volumeUUID))"
     }
 
     // MARK: - Scan Lifecycle
@@ -135,7 +146,7 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 throw IndexError.scanAlreadyInProgress(volumeUUID: volumeUUID)
             }
 
-            let staging = DuckDBStore.stagingTableName(for: volumeUUID)
+            let staging = try DuckDBStore.stagingTableName(for: volumeUUID)
             try conn.execute("DROP TABLE IF EXISTS \"\(staging)\"")
             try conn.execute("""
                 CREATE TABLE "\(staging)" (
@@ -176,7 +187,7 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
     }
 
     private func ingestToStagingOnWriter(conn: Connection, files: [ScannedFile], volumeUUID: String) throws {
-        let staging = DuckDBStore.stagingTableName(for: volumeUUID)
+        let staging = try DuckDBStore.stagingTableName(for: volumeUUID)
         let appender = try Appender(connection: conn, table: staging)
 
         for file in files {
@@ -228,7 +239,7 @@ nonisolated final class DuckDBStore: @unchecked Sendable {
                 throw IndexError.noActiveScan
             }
 
-            let staging = DuckDBStore.stagingTableName(for: volumeUUID)
+            let staging = try DuckDBStore.stagingTableName(for: volumeUUID)
 
             var added: [ScanDiff.Entry] = []
             var modified: [ScanDiff.Entry] = []
