@@ -5,9 +5,10 @@
 
 import Foundation
 import Combine
+import AppKit
 
 @MainActor
-class SearchViewModel: ObservableObject {
+class SearchViewModel: ObservableObject, LiveIndexBridge {
     static let shared = SearchViewModel()
 
     @Published var searchQuery: String = ""
@@ -18,18 +19,26 @@ class SearchViewModel: ObservableObject {
     @Published var scanProgress: String = ""
     @Published var totalFilesIndexed: Int = 0
 
+    @Published var liveIndexStates: [String: LiveIndexState] = [:]
+    @Published var liveIndexError: LiveIndexError? = nil
+
     private let dbManager = DatabaseManager.shared
     private let volumeManager = VolumeManager.shared
     private var duckDBStore: DuckDBStore?
+    private var liveIndex: LiveIndexCoordinator?
 
     private var searchDebounce: AnyCancellable?
     private var searchTask: Task<Void, Never>?
 
+    // Target-action (not AsyncSequence) for NSWorkspace notifications —
+    // AsyncSequence leaks observers unless the task is explicitly cancelled.
+    // Removed in tearDownLiveIndex on applicationWillTerminate.
+    private var observerTokens: [NSObjectProtocol] = []
+
     private init() {
         loadVolumes()
 
-        // Open databases off the main thread so cold-start doesn't block
-        // the first window paint on large metadata files.
+        // Open databases off-main so cold-start doesn't block first window paint.
         Task.detached { [weak self] in
             guard let self else { return }
             do {
@@ -49,6 +58,7 @@ class SearchViewModel: ObservableObject {
                 await MainActor.run {
                     self.duckDBStore = store
                     self.totalFilesIndexed = count
+                    self.setUpLiveIndex(store: store)
                 }
                 await self.performSearch("")
             } catch {
@@ -67,9 +77,193 @@ class SearchViewModel: ObservableObject {
             }
     }
 
+    /// Merge mounted-now volumes with the existing list. Mounted volumes
+    /// stay/become online; previously-known volumes that are no longer
+    /// mounted flip to offline (so indexed offline drives stay searchable).
     func loadVolumes() {
-        volumes = volumeManager.getMountedVolumes()
+        let fresh = volumeManager.getMountedVolumes()
+        let mountedUUIDs = Set(fresh.map { $0.uuid })
+
+        // Update existing rows for currently-mounted volumes; preserve
+        // offline rows that aren't in the fresh list.
+        var updated: [VolumeInfo] = []
+        for vol in volumes {
+            if let live = fresh.first(where: { $0.uuid == vol.uuid }) {
+                updated.append(live)
+            } else {
+                var off = vol
+                off.isOnline = false
+                updated.append(off)
+            }
+        }
+        // Append any newly-mounted volumes not already in the list.
+        for vol in fresh where !updated.contains(where: { $0.uuid == vol.uuid }) {
+            updated.append(vol)
+        }
+        // First-load case: no prior list.
+        if volumes.isEmpty {
+            updated = fresh
+        }
+        // Hide volumes that are offline AND have no indexed files (never used).
+        // This keeps freshly-disconnected drives in the list (they have files)
+        // while not accumulating ghost rows for unrelated unmounts.
+        updated = updated.filter { vol in
+            if vol.isOnline { return true }
+            let hasFiles = (try? duckDBStore?.getFileCountByVolume(vol.uuid)) ?? 0 > 0
+            return hasFiles
+        }
+        _ = mountedUUIDs   // silence unused warning if compiler complains
+        volumes = updated
     }
+
+    // MARK: - Live Index
+
+    private func setUpLiveIndex(store: DuckDBStore) {
+        let coordinator = LiveIndexCoordinator(store: store, dbManager: dbManager, bridge: self)
+        self.liveIndex = coordinator
+
+        // Subscribe before start() — otherwise we could miss a mount that
+        // fires during coordinator init.
+        let wsCenter = NSWorkspace.shared.notificationCenter
+
+        let mountToken = wsCenter.addObserver(
+            forName: NSWorkspace.didMountNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            self.handleMountNotification(note)
+        }
+        let willUnmountToken = wsCenter.addObserver(
+            forName: NSWorkspace.willUnmountNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            self.handleUnmountNotification(note)
+        }
+        let didUnmountToken = wsCenter.addObserver(
+            forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            self.handleUnmountNotification(note)
+        }
+        let willSleepToken = wsCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { await self.liveIndex?.willSleep() }
+        }
+        let didWakeToken = wsCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let mounted = self.volumeManager.getMountedVolumes()
+            Task { await self.liveIndex?.didWake(mounted: mounted) }
+        }
+
+        observerTokens = [mountToken, willUnmountToken, didUnmountToken, willSleepToken, didWakeToken]
+
+        let mounted = volumes
+        Task { await coordinator.start(volumes: mounted) }
+    }
+
+    /// Called from prismApp on applicationWillTerminate.
+    func tearDownLiveIndex() {
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        for token in observerTokens {
+            wsCenter.removeObserver(token)
+        }
+        observerTokens.removeAll()
+
+        liveIndex?.flushOnTerminate()
+    }
+
+    private func handleMountNotification(_ note: Notification) {
+        guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
+        // Pull the freshly-mounted volume from the system and merge it in,
+        // preserving any offline rows we want to keep showing for indexed
+        // volumes.
+        let fresh = volumeManager.getMountedVolumes()
+        guard let mounted = fresh.first(where: { $0.path == url.path }) else { return }
+        if let idx = volumes.firstIndex(where: { $0.uuid == mounted.uuid }) {
+            volumes[idx] = mounted
+        } else {
+            volumes.append(mounted)
+        }
+        Task { await liveIndex?.onMount(volume: mounted) }
+    }
+
+    private func handleUnmountNotification(_ note: Notification) {
+        guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
+        // Find by path, then flip to offline IN PLACE. Don't reload from
+        // mountedVolumeURLs — that would drop the row entirely (or worse,
+        // re-bind it to whatever volume now occupies the slot, e.g. the
+        // boot drive resolving as "external" after a USB unmount).
+        guard let idx = volumes.firstIndex(where: { $0.path == url.path }) else { return }
+        let uuid = volumes[idx].uuid
+        volumes[idx].isOnline = false
+        Task { await liveIndex?.onUnmount(volumeUUID: uuid) }
+    }
+
+    // MARK: - LiveIndexBridge
+
+    nonisolated func liveIndexDidApplyDiff(volumeUUID: String, diff: ScanDiff) async {
+        await MainActor.run {
+            if let count = try? self.duckDBStore?.getFileCount() {
+                self.totalFilesIndexed = count
+            }
+        }
+        // Only re-run the search when membership might have changed (adds
+        // or removes). Modified-only diffs keep their displayed metadata
+        // current via the cache patch — re-searching on every modify
+        // forces the results table to re-render and dismisses any
+        // attached UI like QuickLook mid-interaction.
+        let membershipChanged = !diff.added.isEmpty || !diff.removedIds.isEmpty
+        guard membershipChanged else { return }
+        await self.performSearch(self.searchQuery)
+    }
+
+    nonisolated func liveIndexDidFail(volumeUUID: String, error: LiveIndexError) async {
+        await MainActor.run {
+            self.liveIndexError = error
+        }
+    }
+
+    nonisolated func liveIndexVolumeOnlineChanged(volumeUUID: String, isOnline: Bool) async {
+        await MainActor.run {
+            if let idx = self.volumes.firstIndex(where: { $0.uuid == volumeUUID }) {
+                self.volumes[idx].isOnline = isOnline
+            }
+        }
+    }
+
+    nonisolated func liveIndexDidUpdateState(_ states: [LiveIndexState]) async {
+        await MainActor.run {
+            var map: [String: LiveIndexState] = [:]
+            for s in states { map[s.volumeUUID] = s }
+            self.liveIndexStates = map
+        }
+    }
+
+    func retryLiveIndex() {
+        liveIndexError = nil
+        // onMount is idempotent on volumes already streaming.
+        let mounted = volumes
+        Task { await liveIndex?.start(volumes: mounted) }
+    }
+
+    func setLiveIndexEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(!enabled, forKey: "LiveIndexDisabled")
+        if enabled {
+            let mounted = volumes
+            Task { await liveIndex?.start(volumes: mounted) }
+        } else {
+            Task { await liveIndex?.stop() }
+        }
+    }
+
+    var isLiveIndexEnabled: Bool {
+        !UserDefaults.standard.bool(forKey: "LiveIndexDisabled")
+    }
+
+    // MARK: - Search
 
     func performSearch(_ query: String) async {
         do {
@@ -135,12 +329,6 @@ class SearchViewModel: ObservableObject {
                 }
 
                 let pipelineStart = CFAbsoluteTimeGetCurrent()
-
-                // Incremental flow: beginScan acquires the scan slot;
-                // ingestBatch (called by scanStreaming) writes into the
-                // per-volume staging table; mergeAndDiff identifies
-                // added/modified/removed vs existing `files` rows and
-                // returns the diff for SQLite/cache propagation.
                 try store.beginScan(volumeUUID: volume.uuid)
 
                 let concurrency = volume.isInternal ? 8 : 4
@@ -173,9 +361,6 @@ class SearchViewModel: ObservableObject {
                 let mergeTime = CFAbsoluteTimeGetCurrent() - mergeStart
                 Log.debug("ScanDiff: added=\(diff.added.count) modified=\(diff.modified.count) removed=\(diff.removedIds.count)")
 
-                // First scan of a brand-new DuckDB produces a diff where
-                // every row is in `added` and the cache is empty. loadCache
-                // is still the cheapest path in that case.
                 var syncTime: Double = 0
                 var applyDiffTime: Double = 0
                 if !diff.isEmpty {
@@ -188,8 +373,21 @@ class SearchViewModel: ObservableObject {
                     applyDiffTime = CFAbsoluteTimeGetCurrent() - applyDiffStart
                 }
 
-                // If the cache was never loaded (cold start, first scan),
-                // applyDiff is a no-op. Do a one-time full load.
+                // Queued FSEvents batches — mostly redundant with the scan,
+                // but applyDirectDiff is idempotent so apply defensively.
+                let pending = store.drainPendingBatches(volumeUUID: volume.uuid)
+                for batch in pending {
+                    do {
+                        try store.applyDirectDiff(batch, volumeUUID: volume.uuid)
+                        try self.dbManager.syncSearchIndex(from: store, volumeUUID: volume.uuid, diff: batch)
+                        try store.applyDiff(batch)
+                    } catch {
+                        Log.error("Draining pending batch failed: \(error)")
+                    }
+                }
+
+                // Cold start / first scan: applyDiff was a no-op above
+                // because cache hadn't loaded yet. One-time full hydration.
                 var loadCacheTime: Double = 0
                 if store.getAllCachedValues().isEmpty && (try? store.getFileCount()) ?? 0 > 0 {
                     let loadStart = CFAbsoluteTimeGetCurrent()
@@ -210,6 +408,9 @@ class SearchViewModel: ObservableObject {
                     self.loadAllFiles()
                 }
 
+                // First-time-indexed volume: now eligible for live index.
+                await self.liveIndex?.startWatching(volume: volume)
+
                 try await Task.sleep(nanoseconds: 2_000_000_000)
                 await MainActor.run {
                     self.isScanning = false
@@ -228,18 +429,29 @@ class SearchViewModel: ObservableObject {
         }
     }
 
+    /// Stop watching before the DELETE so an in-flight live-index batch
+    /// can't race it. Re-attach after.
     func clearVolumeFiles(_ volumeUUID: String) throws {
+        Task { await liveIndex?.stopWatching(volumeUUID: volumeUUID) }
+
         try duckDBStore?.deleteFilesByVolume(volumeUUID)
         if let store = duckDBStore {
-            // Clear Index is a full-rebuild operation by design.
             try dbManager.rebuildSearchIndex(from: store)
         }
         results = []
         resultsUpdateID = UUID()
+
+        if let vol = volumes.first(where: { $0.uuid == volumeUUID }) {
+            Task { await liveIndex?.startWatching(volume: vol) }
+        }
     }
 
     func getVolumeFileCount(_ volumeUUID: String) throws -> Int {
         try duckDBStore?.getFileCountByVolume(volumeUUID) ?? 0
+    }
+
+    func getVolumeLastScannedAt(_ volumeUUID: String) throws -> Foundation.Date? {
+        try duckDBStore?.lastScannedAt(volumeUUID: volumeUUID)
     }
 
     func getStoredFileCount() throws -> Int {
@@ -248,11 +460,14 @@ class SearchViewModel: ObservableObject {
 
     func rebuildIndex() async {
         do {
+            await liveIndex?.stop()
             try duckDBStore?.clearAll()
             try dbManager.rebuildDatabase()
             totalFilesIndexed = 0
             results = []
             resultsUpdateID = UUID()
+            let mounted = volumes
+            await liveIndex?.start(volumes: mounted)
         } catch {
             Log.error("Failed to rebuild: \(error)")
         }

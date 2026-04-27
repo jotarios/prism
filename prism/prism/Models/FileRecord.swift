@@ -5,7 +5,6 @@
 
 import Foundation
 
-/// Represents a file indexed in the database
 struct FileRecord: Identifiable {
     let id: Int64
     let filename: String
@@ -16,12 +15,9 @@ struct FileRecord: Identifiable {
     let dateModified: Date
     let dateCreated: Date
     let isOnline: Bool
-
-    /// Audio-specific metadata (nil for non-audio files)
     var durationSeconds: Double?
 }
 
-/// Minimal record for insertion during scanning
 struct FileRecordInsert: Sendable {
     let filename: String
     let path: String
@@ -33,13 +29,10 @@ struct FileRecordInsert: Sendable {
     let isOnline: Bool
 }
 
-/// Diff produced by a scan: rows added, rows whose content changed, and rows
-/// that vanished. Carries the full row data needed by both consumers:
-///   - `DatabaseManager.syncSearchIndex(...)` — uses id/filename/ext for FTS5
-///   - `DuckDBStore.applyDiff(...)` — uses the rest to rebuild SearchResult
-///     for the in-memory cache without re-querying DuckDB
-/// Carrying the full payload costs a few extra fields per diff entry but
-/// eliminates an `IN (27K-ids)` round-trip to DuckDB on every rescan.
+/// Entries carry the full row payload (not just ids) so applyDiff can
+/// rebuild SearchResult without a second IN(...) query against DuckDB.
+/// That round-trip costs ~6s on a 27K-row rescan; the extra fields cost
+/// nothing measurable.
 struct ScanDiff: Sendable {
     struct Entry: Sendable {
         let id: Int64
@@ -48,8 +41,22 @@ struct ScanDiff: Sendable {
         let volumeUUID: String
         let ext: String
         let sizeBytes: Int64
-        let dateModified: Int64   // unix seconds — Date materialized at point of use
+        let dateModified: Int64   // unix seconds
         let dateCreated: Int64
+
+        static func from(scannedFile file: ScannedFile, volumeUUID: String) -> Entry {
+            let path = file.parentPath + "/" + file.filename
+            return Entry(
+                id: PathHash.id(volumeUUID: volumeUUID, path: path),
+                filename: file.filename,
+                path: path,
+                volumeUUID: volumeUUID,
+                ext: file.ext,
+                sizeBytes: Int64(file.sizeBytes),
+                dateModified: Int64(file.modTimeSec),
+                dateCreated: Int64(file.createTimeSec)
+            )
+        }
     }
 
     let added: [Entry]
@@ -61,7 +68,6 @@ struct ScanDiff: Sendable {
     static let empty = ScanDiff(added: [], modified: [], removedIds: [])
 }
 
-/// Search result record optimized for display
 struct SearchResult: Identifiable, Equatable {
     let id: Int64
     let filename: String

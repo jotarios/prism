@@ -110,7 +110,15 @@ FTS5 rowid with no translation.
    - Collision probability ~7e-9 at 5M rows; collisions throw
      `IndexError.hashCollision`.
 
-6. **SearchViewModel** (`ViewModels/SearchViewModel.swift`)
+6. **LiveIndexCoordinator** (`Scanner/LiveIndexCoordinator.swift`) — Phase 3
+   - Actor owning FSEventStream per watched volume + NSWorkspace mount/unmount
+   - Classifies FSEvents flags; files → direct-diff path, dirs + MustScanSubDirs → staging fallback
+   - Coalesces events in a quiescence window (2s idle / 10s max / 10k cap) then applies
+   - E+poll fallback: on `HistoryDone` with inconsistent state, flips volume to polling mode with a 5-min `DispatchSourceTimer`
+   - Bridges back to UI via `LiveIndexBridge` protocol (SearchViewModel implements it)
+   - Disable via `UserDefaults["LiveIndexDisabled"]`; also exposed as Settings toggle
+
+7. **SearchViewModel** (`ViewModels/SearchViewModel.swift`)
    - Search path: FTS5 prefix match → IDs → cache dictionary lookup
    - Scan path: `beginScan` → `ParallelScanCoordinator.scanStreaming` (writes
      into staging) → `mergeAndDiff` → incremental `syncSearchIndex` →
@@ -159,6 +167,69 @@ are ~200ms each — see "DuckDB point lookups" below).
 Empty-diff rescans skip the sync entirely and patch the cache with zero
 rows — rescanning an unchanged volume does near-zero post-scan work.
 
+### Live Index Flow (Phase 3)
+
+```
+NSWorkspace didMount ──▶ LiveIndexCoordinator.onMount(volume)
+                                    │
+                                    ▼
+              loadWatchState (last_event_id) + createFSEventStream
+                                    │
+                                    ▼
+              Stream fires callback on fsEventsQueue (serial DispatchQueue)
+                                    │
+                       classify events (flags matrix)
+                                    │
+       ┌────────────────────────────┼─────────────────────────────┐
+       │                            │                             │
+ MustScanSubDirs /           Normal file events          HistoryDone
+ UserDropped /                      │                             │
+ KernelDropped /                    ▼                      E+poll heuristic:
+ ItemIsDir+Created      coalescer (2s idle, 10s max,     did replay return
+       │                 10k size cap)                    nothing while files
+       ▼                            │                     look stale?
+ staging path:                      ▼                             │
+   beginScan +                buildDiff (grouped by                │ yes → polling_mode
+   ParallelScanCoordinator +    parent dir, 1 bulk-stat            │       + 5min timer
+   mergeAndDiff +               per dir; rename → remove+add)      │ no  → listening
+   pendingBatches drain               │
+                                      ▼
+                              applyDirectDiff
+                              (INSERT ... ON CONFLICT DO UPDATE,
+                              chunked 1k rows, writer NSLock
+                              released between chunks)
+                                      │
+                                      ▼
+                              dbManager.syncSearchIndex (existing)
+                                      │
+                                      ▼
+                              duckDBStore.applyDiff (existing cache patch)
+                                      │
+                                      ▼
+                              persistEventId (AFTER both commits succeed)
+                                      │
+                                      ▼
+                              bridge.liveIndexDidApplyDiff → SearchViewModel
+                                      │
+                                      ▼
+                              UI refresh via @Published state
+```
+
+FSEvents direct-diff re-uses the same `ScanDiff` struct as full scans. The
+only new on-disk state is `volume_watch_state(volume_uuid PRIMARY KEY,
+last_event_id, last_seen_at, polling_mode, last_reason)`. 
+
+Back-pressure: if pending event count > 100k, abandon direct-diff and
+trigger a full-volume rescan. New events arriving during that rescan are
+dropped — `mergeAndDiff` at the end reconciles the current filesystem state
+anyway.
+
+Mount/unmount via NSWorkspace target-action observers stored as
+`NSObjectProtocol` tokens on `SearchViewModel`; teardown via
+`removeObserver` on `applicationWillTerminate`. AsyncSequence-based
+observation leaks without explicit cancellation, so target-action is
+preferred.
+
 ### Audio File Filtering
 
 The scanner only indexes audio files with these extensions:
@@ -193,7 +264,10 @@ All logging goes through `Log.swift` using `os.Logger`:
 - **DuckDB point lookups**: Slow (200ms+ for IN(...) queries). Use in-memory cache instead. This is why `ScanDiff.Entry` carries full row data — `applyDiff` must NOT hit DuckDB after mergeAndDiff, even for "correctness refetch." See the Scan Flow diagram.
 - **FTS5 bulk rebuild** (`INSERT INTO files_fts(files_fts) VALUES('rebuild')`) beats per-row triggers for bulk inserts, but fragments FTS5 segments on incremental paths. Incremental sync fires a `'rebuild'` pass only when the diff is ≥1000 mutations.
 - **Staging tables are per-volume**: `files_staging_<sanitized_uuid>`. Sanitization replaces `-` with `_` and the name is double-quoted in SQL. Orphan staging tables (from crashed scans) are dropped at `DuckDBStore.init` via `cleanupOrphanedStaging`.
-- **Scan slot**: `currentScanVolume` in `DuckDBStore` serializes scans. Concurrent `beginScan` throws. Required because the merge SQL assumes exclusive access to the scan's staging table.
+- **Scan slots are per-volume** (Phase 3): `currentScanVolumes: Set<String>` in `DuckDBStore`. `beginScan` on different volumes succeeds concurrently; `beginScan` twice on the SAME volume throws `scanAlreadyInProgress`. The writer connection is still NSLock-serialized, so parallelism is in scan I/O + staging INSERTs; `mergeAndDiff` and `applyDirectDiff` still serialize. Works through sequential interleaving from one executor (the `LiveIndexCoordinator` actor); true multi-threaded parallel use of `DuckDBStore` is not supported — see `MultiVolumeConcurrentScanTests`.
+- **`applyDirectDiff` idempotency**: FSEvents replay sends the same events after app restart. Direct-diff must be idempotent. Implementation uses `INSERT ... ON CONFLICT (id) DO UPDATE SET ...` (NOT Appender, which doesn't support ON CONFLICT — the plan's DELETE+Appender attempt triggered the same unique-constraint index error as direct conflicts). `volume_uuid` is excluded from the UPDATE SET because it's indexed and DuckDB rejects UPDATE SET on indexed columns; same id implies same (volume_uuid, path) by PathHash construction anyway.
+- **`volume_watch_state` table** (Phase 3): per-volume FSEvents checkpoint + polling-mode flag. Event-id persists AFTER both DuckDB and SQLite commits succeed (revised cadence from `/plan-ceo-review` Reviewer Concern #3 — atomic-with-DuckDB risks advancing the event-id while SQLite sync fails, producing phantom gaps in FTS5).
+- **E+poll ExFAT fallback** (Phase 3): FSEvents is unreliable on non-journaled filesystems (ExFAT, FAT, NTFS). On `HistoryDone`, if replay returned zero events AND `MAX(files.date_modified)` predates the mount time, treat as inconsistent and flip `polling_mode = TRUE`. A `DispatchSourceTimer` at 5-minute interval then drives `triggerFullRescan` for that volume. Compare against mount time (NOT `last_seen_at`) to avoid DST-transition false positives — ExFAT stores local time without timezone.
 
 ## Performance Targets
 

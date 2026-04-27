@@ -8,14 +8,18 @@ import SwiftUI
 struct SidebarView: View {
     @ObservedObject var viewModel: SearchViewModel
 
-    // Filter to show only external volumes
     private var externalVolumes: [VolumeInfo] {
         viewModel.volumes.filter { !$0.isInternal }
     }
 
+    private var footerCountText: String {
+        let n = viewModel.totalFilesIndexed
+        let formatted = n.formatted(.number)
+        return "\(formatted) \(n == 1 ? "track" : "tracks")"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
             HStack {
                 Text("Volumes")
                     .font(.headline)
@@ -32,7 +36,6 @@ struct SidebarView: View {
 
             Divider()
 
-            // Volume list (external only)
             if externalVolumes.isEmpty {
                 VStack {
                     Spacer()
@@ -48,17 +51,30 @@ struct SidebarView: View {
             } else {
                 List {
                     ForEach(externalVolumes) { volume in
-                        VolumeRow(volume: volume, viewModel: viewModel)
+                        VolumeRow(
+                            volume: volume,
+                            state: viewModel.liveIndexStates[volume.uuid],
+                            viewModel: viewModel
+                        )
                     }
                 }
                 .listStyle(.sidebar)
             }
 
+            // Auto-fade when error clears.
+            if let err = viewModel.liveIndexError {
+                LiveIndexBanner(error: err) {
+                    viewModel.retryLiveIndex()
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+                .transition(.opacity)
+            }
+
             Divider()
 
-            // Stats footer
             VStack(alignment: .leading, spacing: 4) {
-                Text("\(viewModel.totalFilesIndexed) files indexed")
+                Text(footerCountText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -69,43 +85,14 @@ struct SidebarView: View {
                         Text(viewModel.scanProgress)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                 }
             }
             .padding()
         }
-    }
-}
-
-struct VolumeRow: View {
-    let volume: VolumeInfo
-    @ObservedObject var viewModel: SearchViewModel
-
-    var body: some View {
-        HStack {
-            Image(systemName: volume.isInternal ? "internaldrive" : "externaldrive.fill")
-                .foregroundStyle(volume.isOnline ? .blue : .secondary)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(volume.name)
-                    .font(.body)
-                Text(volume.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            Button(action: {
-                viewModel.scanVolume(volume)
-            }) {
-                Image(systemName: "arrow.down.circle")
-            }
-            .buttonStyle(.borderless)
-            .help("Scan volume")
-            .disabled(viewModel.isScanning)
-        }
-        .padding(.vertical, 4)
+        .animation(.easeInOut(duration: 0.3), value: viewModel.liveIndexError != nil)
     }
 }
 

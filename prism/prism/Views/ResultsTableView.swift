@@ -35,25 +35,23 @@ struct ResultsTableView: View {
             .contextMenu(forSelectionType: SearchResult.ID.self) { items in
                 contextMenuContent(for: items)
             } primaryAction: { items in
-                // Double-click action
                 if let id = items.first,
                    let result = sortedResults.first(where: { $0.id == id }) {
-                    quickLookURL = URL(fileURLWithPath: result.path)
+                    if result.isOnline {
+                        quickLookURL = URL(fileURLWithPath: result.path)
+                    } else {
+                        showOfflineAlert(for: result)
+                    }
                 }
             }
             .onKeyPress(" ") {
                 handleSpaceKey()
                 return .handled
             }
-            .onChange(of: selection) {
-                quickLookURL = nil
-            }
-            .onChange(of: viewModel.resultsUpdateID) {
-                // Clear selection when results update
-                Task { @MainActor in
-                    selection.removeAll()
-                }
-            }
+            // QuickLook lifetime is independent of selection. The user
+            // dismisses with Esc / close button. Closing the sheet on
+            // selection change conflicts with live-index updates that
+            // bump resultsUpdateID and clear selection mid-playback.
             .sheet(item: quickLookBinding) { item in
                 QuickLookPreviewView(url: item.url)
                     .frame(minWidth: 700, minHeight: 500)
@@ -64,9 +62,20 @@ struct ResultsTableView: View {
         Table(sortedResults, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("Name", value: \.filename) { result in
                 HStack(spacing: 8) {
-                    Image(systemName: "music.note")
-                        .foregroundStyle(.blue)
+                    ZStack(alignment: .bottomTrailing) {
+                        Image(systemName: "music.note")
+                            .foregroundStyle(result.isOnline ? Color.blue : Color.secondary)
+
+                        if !result.isOnline {
+                            Image(systemName: "minus.circle.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(Color.secondary)
+                                .offset(x: 2, y: 2)
+                                .accessibilityHidden(true)
+                        }
+                    }
                     Text(result.filename)
+                        .foregroundStyle(result.isOnline ? Color.primary : Color.secondary)
                 }
             }
             .width(min: 200, ideal: 300)
@@ -74,18 +83,21 @@ struct ResultsTableView: View {
             TableColumn("Date Modified", value: \.dateModified) { result in
                 Text(result.dateModified.formatted(date: .abbreviated, time: .shortened))
                     .monospacedDigit()
+                    .foregroundStyle(result.isOnline ? Color.primary : Color.secondary)
             }
             .width(min: 140, ideal: 160)
 
             TableColumn("Size", value: \.sizeBytes) { result in
                 Text(result.formattedSize)
                     .monospacedDigit()
+                    .foregroundStyle(result.isOnline ? Color.primary : Color.secondary)
             }
             .width(min: 80, ideal: 100)
 
             TableColumn("Duration") { result in
                 Text(result.formattedDuration)
                     .monospacedDigit()
+                    .foregroundStyle(result.isOnline ? Color.primary : Color.secondary)
             }
             .width(min: 80, ideal: 100)
 
@@ -163,6 +175,18 @@ struct ResultsTableView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(result.path, forType: .string)
+    }
+
+    private func showOfflineAlert(for result: SearchResult) {
+        let driveName = (result.volumeUUID as NSString).lastPathComponent
+        let alert = NSAlert()
+        alert.messageText = "File unavailable"
+        alert.informativeText = "This file is on '\(driveName)' which isn't connected. Reconnect the drive to open it."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Cancel")
+        // Placeholder — sidebar scroll-to-volume is Phase 3.1.
+        alert.addButton(withTitle: "Show Volume in Sidebar")
+        _ = alert.runModal()
     }
 }
 

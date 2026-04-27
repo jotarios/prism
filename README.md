@@ -251,9 +251,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [x] **MVP**: Basic UI, file scanner, database, instant search
 - [x] **Ingestion v2**: `getattrlistbulk`, parallel scanning, DuckDB tiered storage
 - [x] **Sync v2**: Incremental FTS5 sync, hash-derived stable IDs, staging-table merge, incremental cache patching
-- [ ] **Phase 3**: FSEvents monitoring, auto-indexing on drive mount
+- [x] **Phase 3 (Live Index)**: FSEvents per mounted volume + NSWorkspace mount/unmount + direct-diff apply path + per-volume scan slots + `volume_watch_state` event-id persistence + offline search (dimmed rows + reconnect alert) + sidebar activity meter + error banner + E+poll ExFAT/FAT/NTFS fallback + Settings toggle
+- [ ] **Phase 3.1**: Changes-since-mount banner, new-arrival dot overlay (polish deferred from Phase 3)
 - [ ] **Phase 4**: ID3 tag metadata extraction (artist, album, genre, duration), drag-and-drop
-- [ ] **Phase 5**: Advanced filters, offline drive handling, user-configurable ignore-directory list (currently a static `Set<String>` on `BulkScanner`)
+- [ ] **Phase 5**: Advanced filters, user-configurable ignore-directory list (currently a static `Set<String>` on `BulkScanner`)
 - [ ] **Phase 6**: Semantic search — query by mood, genre, or concept ("sad songs", "workout music"). ID3 genre/mood tags + filename-based artist lookup + optional local LLM enrichment for untagged files. Hybrid approach: three tiers of coverage depending on available metadata
 
 ## Architecture TODOs
@@ -262,8 +263,8 @@ Known limitations and planned improvements from internal review. Ordered by impa
 
 ### Concurrency & throughput
 
-- [ ] **Multi-connection DuckDB (1 writer + N readers)** — today a single `NSLock`-protected `Connection` serializes every read/write, so search blocks on `ingestBatch` during a scan. Open dedicated reader connections and drop the lock to reader-writer semantics. Biggest UX win: search-during-scan.
-- [ ] **Unblock search during active scans** — until multi-connection lands, route search through a read-only snapshot or disable the search bar with a clear UI affordance instead of queuing behind the ingest writer.
+- [x] **Multi-connection DuckDB (1 writer + N readers)** — shipped. Searches run on a 3-connection reader pool; writes serialize through `WriterConnection`'s NSLock.
+- [x] **Per-volume scan slots** (Phase 3) — `currentScanVolumes: Set<String>` replaces the single-scan-slot design. Sequential interleaving across volumes works; true multi-threaded parallel use of DuckDB is not supported (writer NSLock is a correctness wall, not just a throughput bottleneck — see `MultiVolumeConcurrentScanTests`).
 - [ ] **Cancellable scan workers** — `ParallelScanCoordinator.cancel()` only checks between task-group iterations; in-flight `BulkScanner.scanDirectory` blocking syscalls run to completion. Cancel is currently "eventually stops," not "stops now."
 - [ ] **Backpressured AsyncStream (SE-0406)** — current stream uses `.unbounded`, which is correct but lets RAM grow if the DuckDB writer stalls. Migrate once the Swift version allows.
 
